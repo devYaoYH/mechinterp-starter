@@ -22,6 +22,19 @@ python template_new_task.py --n-pairs 12   # probe -> intervene -> 3 figures
 If `smoke_test.py` is green, the stack works and any wrong number after that is
 your experiment, not your environment. Run it again after any dependency bump.
 
+`template_new_task.py` writes these three figures, and they are what the plotting
+module produces by default — reference line, bootstrap CI band, and `n` stated:
+
+| Probe, with its controls | Causal effect, two positions |
+|---|---|
+| ![probe by layer](docs/probe_by_layer.png) | ![causal by layer](docs/causal_by_layer.png) |
+
+![effect grid](docs/effect_grid.png)
+
+In the left figure the probe hits 1.00 while the **shortcut-leak control** also
+hits 1.00 — the harness reporting that the probe decoded the subject rather than
+the answer. That is the intended demonstration, not a good result.
+
 ## What's here
 
 ```
@@ -62,6 +75,8 @@ generated token (rollout) — so every check applies to both. It prints a verdic
 (`READY` / `WARN` / `BLOCKED`) headless; open `viewer.html` and drop the JSON in
 for the interactive version, which also shows you *which* rows clash.
 
+![capture gate viewer](docs/viewer-light.png)
+
 The subtle check is tied rows — different labels on identical activations — and
 what it means depends on the capture kind:
 
@@ -101,6 +116,10 @@ wrong metric — score probabilities (AUROC, calibration) instead.
 | 9 | `mechinterp/plotting.py` | 169 | mostly matplotlib mechanics; skim |
 | 10 | `smoke_test.py` | 254 | each check names a real failure — read as a trap list |
 | 11 | `template_new_task.py` | 117 | how the pieces compose |
+
+Regenerate the images in `docs/` with `python tools/screenshot_viewer.py`
+(needs `uv pip install playwright && python -m playwright install chromium`) and
+`python template_new_task.py`.
 
 Every module is plain functions over numpy/torch. There is no framework, no
 registry, no config system, and nothing is subclassed except `Steerer._should_fire`.
