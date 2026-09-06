@@ -49,7 +49,9 @@ def probe(X_train, y_train, X_test, y_test, leak_X=None, leak_y=None, C=0.1,
     the shortcut. See the module docstring.
 
     -> dict(score, shuffled_score, leak_score, chance, n_train, n_features,
-            underdetermined)
+            underdetermined, per_item)
+    `per_item` is the 0/1 correctness vector on the test set (accuracy metric
+    only) -- feed it to plotting.bootstrap_ci for an interval on the score.
     """
     X_train, X_test = np.asarray(X_train), np.asarray(X_test)
     y_train, y_test = np.asarray(y_train), np.asarray(y_test)
@@ -68,11 +70,11 @@ def probe(X_train, y_train, X_test, y_test, leak_X=None, leak_y=None, C=0.1,
     def _fit_score(ytr, Xte, yte):
         clf = _pipeline(n_train, n_features, C=C).fit(X_train, ytr)
         if metric == "auroc":
-            return roc_auc_score(yte, clf.predict_proba(Xte)[:, 1])
-        return clf.score(Xte, yte)
+            return roc_auc_score(yte, clf.predict_proba(Xte)[:, 1]), None
+        return clf.score(Xte, yte), (clf.predict(Xte) == yte).astype(float)
 
-    score = _fit_score(y_train, X_test, y_test)
-    shuffled = _fit_score(np.random.RandomState(0).permutation(y_train), X_test, y_test)
+    score, per_item = _fit_score(y_train, X_test, y_test)
+    shuffled, _ = _fit_score(np.random.RandomState(0).permutation(y_train), X_test, y_test)
 
     leak = None
     if leak_X is not None:
@@ -81,7 +83,7 @@ def probe(X_train, y_train, X_test, y_test, leak_X=None, leak_y=None, C=0.1,
 
     return dict(score=float(score), shuffled_score=float(shuffled), leak_score=leak,
                 chance=chance, n_train=int(n_train), n_features=int(n_features),
-                underdetermined=bool(underdetermined))
+                underdetermined=bool(underdetermined), per_item=per_item)
 
 
 def grouped_split(groups, test_frac=0.3, seed=0):

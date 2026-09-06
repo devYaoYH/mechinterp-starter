@@ -184,6 +184,37 @@ def main():
 
     check("underdetermined regime is flagged", underdetermined_warning)
 
+    print(f"\n=== figures ===")
+
+    def figures_render():
+        import tempfile
+
+        from mechinterp import plotting
+        d = [100 * i / 12 for i in range(12)]
+        rng = np.random.RandomState(0)
+        per_layer = [list(rng.rand(8)) for _ in range(12)]
+        with tempfile.TemporaryDirectory() as td:
+            ax = plotting.layer_sweep({"a": per_layer, "b": per_layer}, d, "t", n=8)
+            plotting.save(ax.figure, f"{td}/sweep.png")
+            ax2 = plotting.probe_panel(d, per_layer, [0.1] * 12, 0.1, "t", n=8,
+                                       leak=[0.2] * 12)
+            plotting.save(ax2.figure, f"{td}/probe.png")
+            fig, _ = plotting.effect_grid(rng.rand(2, 12), ["x", "y"], d, "t", n=8)
+            plotting.save(fig, f"{td}/grid.png")
+            import os as _os
+            sizes = [_os.path.getsize(f"{td}/{f}") for f in
+                     ("sweep.png", "probe.png", "grid.png")]
+        assert all(s > 5000 for s in sizes), f"suspiciously small renders: {sizes}"
+        try:
+            plotting.layer_sweep({str(i): per_layer for i in range(4)}, d, "t")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("4-series cap not enforced")
+        return f"3 forms render ({', '.join(f'{s//1024}kB' for s in sizes)}), series cap enforced"
+
+    check("figures render headless", figures_render)
+
     print()
     if failures:
         print(f"{len(failures)} check(s) FAILED: {', '.join(failures)}")
