@@ -2,9 +2,16 @@
 
 Probe training, patching sweeps and steering runs are expensive and, worse,
 they return plausible numbers on a broken dataset. The failures that matter
-here do not raise: tokens misaligned, a subject index on the wrong token, rows
-that are byte-identical across labels (so the task is degenerate by
-construction), one class nearly absent, too few groups to split by.
+here do not raise: tokens misaligned, a subject index on the wrong token, one
+class nearly absent, too few groups to split by, more dimensions than rows.
+
+The subtle one is tied rows -- different labels on identical activations. For a
+STATIC capture that means the contrast set is broken. For a ROLLOUT capture it
+is expected: sampling gives one prompt several outcomes, and every sample shares
+the prefix state, so that state predicts P(correct) rather than a label. Both
+are reported as an accuracy CEILING -- the best any function of these
+activations could score -- plus, for rollouts, a ceiling per position, which is
+where the shared prefix stops capping what a probe can learn.
 
 This dumps a capture -- static prompts OR sampled rollouts -- to self-contained
 JSON, runs the gate checks, and prints a verdict. Drag the JSON into the viewer
@@ -102,7 +109,38 @@ def _finish(kind, model, NL, V, items, pool, slots):
            "n_layers": NL, "hidden_size": int(V.shape[-1]) if V.size else 0,
            "pool": pool, "lens_slots": slots, "items": items, "separation": sep}
     cap["checks"] = gate(cap)
+    if kind == "rollout":
+        cap["ceiling_by_pos"] = ceiling_by_position(cap)
     return cap
+
+
+def _ceiling(rows):
+    """Best accuracy any function of these activations could reach.
+
+    Rows sharing an activation value must all get the same prediction, so the
+    most they can contribute is their majority label. -> (ceiling, n_tied)
+    """
+    from collections import Counter, defaultdict
+    by = defaultdict(Counter)
+    for it, r in rows:
+        if it["label"] is not None:
+            by[r["hashes"][-1]][it["label"]] += 1
+    total = sum(sum(c.values()) for c in by.values())
+    if not total:
+        return 1.0, 0
+    best = sum(max(c.values()) for c in by.values())
+    return best / total, sum(1 for c in by.values() if len(c) > 1)
+
+
+def ceiling_by_position(cap):
+    """Accuracy ceiling per position offset -- for rollouts, this is where the
+    prefix stops being shared and the label becomes learnable at all."""
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for it in cap["items"]:
+        for r in it["rows"]:
+            groups[r["pos"]].append((it, r))
+    return {pos: round(_ceiling(rs)[0], 4) for pos, rs in sorted(groups.items())}
 
 
 def gate(cap):
@@ -132,15 +170,30 @@ def gate(cap):
             f"{counts}, minority class {minority:.1%}"
             + ("" if minority >= 0.2 else " -- too few of one class to learn from"))
 
-    # Rows identical at the final slot but labelled differently: the task is
-    # degenerate at this site by construction, and no probe can beat chance.
-    by_hash = {}
-    for it, r in rows:
-        by_hash.setdefault(r["hashes"][-1], set()).add(it["label"])
-    clashes = sum(1 for v in by_hash.values() if len(v) > 1)
-    add("no degenerate rows", clashes == 0, False,
-        f"{clashes} activation values shared across different labels"
-        + (" -- identical inputs cannot carry label information" if clashes else ""))
+    # Rows identical at the final slot but labelled differently. What this means
+    # depends on the capture kind, so do NOT just fail on it:
+    #   static  -- the contrast set is broken. Two inputs you labelled differently
+    #              produced the same activation, so the task is degenerate.
+    #   rollout -- EXPECTED. Sampling means one prompt yields different outcomes,
+    #              and every sample shares the prefix state. The state genuinely
+    #              predicts P(correct), not a deterministic label.
+    # Either way the useful number is the same: the best accuracy any function of
+    # these activations could reach, since tied rows can only be answered with
+    # their majority label.
+    ceil_overall, ties = _ceiling(rows)
+    if cap["kind"] == "static":
+        add("contrast set is separable", ties == 0, False,
+            f"{ties} activation values shared across different labels"
+            + (" -- identical inputs cannot carry label information" if ties else ""))
+    else:
+        base = max(known.count(c) for c in set(known)) / len(known) if known else 1.0
+        add("labels predictable above base rate", ceil_overall - base > 0.05,
+            ceil_overall - base > 0.01,
+            f"accuracy ceiling {ceil_overall:.3f} vs base rate {base:.3f} "
+            f"({ties} tied activation values)"
+            + ("" if ceil_overall - base > 0.05 else
+               " -- little deterministic signal; score probabilities (AUROC/calibration), "
+               "not per-row accuracy"))
 
     n_marks = sum(len(it["marks"]) for it in items)
     bad_marks = [(it["prompt"], n, m) for it in items for n, m in it["marks"].items()

@@ -62,11 +62,27 @@ generated token (rollout) — so every check applies to both. It prints a verdic
 (`READY` / `WARN` / `BLOCKED`) headless; open `viewer.html` and drop the JSON in
 for the interactive version, which also shows you *which* rows clash.
 
-The degenerate-row check is the one that earns its keep. Sampled rollouts of the
-same prompt share prefix tokens, so their early-position activations are
-identical while carrying different correctness labels — a task that is
-unlearnable by construction at those positions. That is invisible in an array
-and obvious in the gate.
+The subtle check is tied rows — different labels on identical activations — and
+what it means depends on the capture kind:
+
+- **static**: the contrast set is broken. Two inputs you labelled differently
+  produced the same activation, so nothing can separate them.
+- **rollout**: expected. Sampling gives one prompt several outcomes, and every
+  sample shares the prefix state, so that state predicts *P(correct)*, not a
+  label.
+
+Both are reported as an accuracy **ceiling** — the best score any function of
+these activations could reach — rather than a pass/fail. For rollouts the gate
+also breaks the ceiling down by position, which is where the shared prefix stops
+capping what a probe can learn:
+
+```
+ceiling by position: -10:0.89  -9:0.89  -8:0.89  -7:0.94  -6:0.94
+                      -5:0.94  -4:1.00  -3:1.00  -2:1.00  -1:1.00
+```
+
+Probe where the ceiling clears the base rate. Below it, per-row accuracy is the
+wrong metric — score probabilities (AUROC, calibration) instead.
 
 ## Reading order
 
