@@ -38,9 +38,24 @@ Use `AskUserQuestion` to settle:
 from mechinterp import activations as A, loading, patching
 model = loading.load_nnsight(model_id, quant)
 A.assert_aligned(tok, clean, corrupt)        # equal token count, not just index
-eff, clean_lg, corr_lg = patching.sweep_layers(
-    model, clean, corrupt, position, id_a, id_b)
+eff, clean_lg, corr_lg = patching.sweep_pair(
+    model, clean, corrupt, {"subject": subj, "final": -1}, id_a, id_b)
 ```
+
+`sweep_pair` reads the donor once for every (layer, position). Do not loop
+`patch_at` per layer — that re-traces the donor prompt each time, roughly
+doubling the sweep.
+
+**Patching a whole residual stream is not the only intervention.** When the
+claim came from a probe, the direct test is to ablate *that direction*:
+
+```python
+with steering.Ablator(model, layer, direction, coeff=1.0):
+    out = model.generate(...)
+```
+
+Sweep `steering.random_control(direction)` alongside — ablating any direction
+costs the model something, and the claim needs this one to cost more.
 
 Non-negotiables, each of which has silently produced a wrong published-looking
 curve:
@@ -49,9 +64,13 @@ curve:
   genuinely ambiguous and gets read upside down.
 - **Use `normalized_effect`**, not the argmax token: 0.0 = nothing, 1.0 = fully
   reproduced the donor.
-- **Many pairs, not one.** Report mean and spread. Drop pairs where the model
-  gets the underlying fact wrong — the normalization denominator is meaningless
-  there, and say how many you dropped.
+- **Many pairs, not one — and vary BOTH sides.** Report mean and spread. Drop
+  pairs where the model gets the underlying fact wrong (the normalization
+  denominator is meaningless there) and say how many you dropped. Check the
+  pairs are not all one recipient against many donors: `itertools.permutations`
+  yields `(0,1), (0,2), (0,3)...`, so a plain `[:n]` gives `n` donors against a
+  single recipient, and the CI over those understates the spread of any
+  population claim. Report distinct recipients next to `n`.
 - **Negative positions**: `patch_at` resolves them, but if you slice by hand,
   `x[:, -1:0, :]` is an empty slice and the whole sweep silently reads 0.000.
 - **Sanity-assert the write landed** — a patch that does nothing looks exactly

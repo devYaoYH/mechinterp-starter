@@ -38,7 +38,7 @@ the answer. That is the intended demonstration, not a good result.
 ## What's here
 
 ```
-smoke_test.py             14 checks over the whole stack -- run this first
+smoke_test.py             20 checks over the whole stack -- run this first
 template_new_task.py      full arc for a fresh question: probe -> intervene -> plot
 example_steering.py       worked example: direction -> calibrate -> steer + control
 dump_capture.py           gate a capture (static or rollout) before training on it
@@ -48,11 +48,12 @@ mechinterp/loading.py     model loading; the bf16 / nf4 / prequantized branch
 mechinterp/activations.py extraction, token lookup, prompt-alignment assert
 mechinterp/patching.py    cross-run patching + the normalized effect metric
 mechinterp/readout.py     logit lens
-mechinterp/probing.py     linear probe with shuffled null, leak test, split
+mechinterp/probing.py     linear probe with shuffled null, leak test, recall@FPR
 mechinterp/plotting.py    three figure forms with CI bands and reference lines
-mechinterp/steering.py    concept directions, coefficient calibration, steering hook
+mechinterp/steering.py    concept directions, calibration, steering + ablation hooks
 mechinterp/rollout.py     activations from sampled generation, not one forward pass
 mechinterp/quantization.py  quantize, persist, and measure fidelity vs dense
+mechinterp/cache.py       on-disk activation cache, keyed on the weights as loaded
 .claude/skills/           /fit-probe /run-intervention /report-figure /quantize-model
 setup.sh                  GPU-arch-aware bootstrap
 ```
@@ -101,28 +102,30 @@ wrong metric — score probabilities (AUROC, calibration) instead.
 
 ## Reading order
 
-1353 lines total, meant to be read end to end in an afternoon. Start here:
+1693 lines total, meant to be read end to end in an afternoon. Start here:
 
 | # | File | Lines | Why |
 |---|---|---|---|
 | 1 | `mechinterp/loading.py` | 55 | the three quant modes and the shared CLI |
-| 2 | `mechinterp/activations.py` | 80 | the `hs[L+1]` indexing convention everything else assumes |
+| 2 | `mechinterp/activations.py` | 160 | the `hs[L+1]` indexing convention everything else assumes |
 | 3 | `mechinterp/readout.py` | 37 | logit lens, and the already-normed trap |
-| 4 | `mechinterp/patching.py` | 67 | noising vs denoising, the normalized metric |
-| 5 | `mechinterp/probing.py` | 101 | the four controls |
-| 6 | `mechinterp/steering.py` | 138 | calibration — read `calibrate` closely |
-| 7 | `mechinterp/rollout.py` | 119 | sampled generation, if you need it |
-| 8 | `mechinterp/quantization.py` | 96 | two-phase fidelity, if you need it |
-| 9 | `mechinterp/plotting.py` | 169 | mostly matplotlib mechanics; skim |
-| 10 | `smoke_test.py` | 254 | each check names a real failure — read as a trap list |
-| 11 | `template_new_task.py` | 117 | how the pieces compose |
+| 4 | `mechinterp/patching.py` | 121 | noising vs denoising, the normalized metric |
+| 5 | `mechinterp/probing.py` | 170 | the five controls |
+| 6 | `mechinterp/steering.py` | 199 | calibration — read `calibrate` closely, then `Ablator` |
+| 7 | `mechinterp/cache.py` | 43 | what a cache key has to cover |
+| 8 | `mechinterp/rollout.py` | 119 | sampled generation, if you need it |
+| 9 | `mechinterp/quantization.py` | 96 | two-phase fidelity, if you need it |
+| 10 | `mechinterp/plotting.py` | 169 | mostly matplotlib mechanics; skim |
+| 11 | `smoke_test.py` | 386 | each check names a real failure — read as a trap list |
+| 12 | `template_new_task.py` | 134 | how the pieces compose |
 
 Regenerate the images in `docs/` with `python tools/screenshot_viewer.py`
 (needs `uv pip install playwright && python -m playwright install chromium`) and
 `python template_new_task.py`.
 
 Every module is plain functions over numpy/torch. There is no framework, no
-registry, no config system, and nothing is subclassed except `Steerer._should_fire`.
+registry and no config system. The only inheritance is `Ablator(Steerer)`, which
+reuses the hook lifecycle and replaces `_hook`.
 
 ## Skills
 
@@ -161,7 +164,7 @@ quantization moves the residual stream by 1-2%, and drift compounds with depth �
 enough to shift a marginal probe score, not enough to move a sharp causal
 crossover. Below 0.95 top-1 agreement, treat it as a different model.
 
-## The four traps this encodes
+## The five traps this encodes
 
 Each of these produced a *plausible wrong number* rather than an error, and each
 has a smoke-test check.
@@ -183,12 +186,20 @@ Indexing convention throughout: `hidden_states[L + 1]` is the output of decoder
 layer `L`, matching `model.model.layers[L].output` under nnsight. Keeping those
 aligned is what lets an observation sweep and an intervention sweep be overlaid.
 
-**3. A negative position silently patches nothing.** `x[:, -1:-1+1, :]` is
+**3. `output_hidden_states` is blind to forward hooks.** A `Steerer` or
+`Ablator` demonstrably changes the logits, but `activations.all_layers` /
+`pooled` return the site exactly as if the hook were not there — so the obvious
+way to verify an intervention landed reports that it did not. Read an intervened
+run with `activations.capture_hooked`, whose own hook sees the substituted
+output (enter the intervention first; hooks run in registration order). Measured:
+component 1.955 → 0.017 via `capture_hooked`, → 1.955 via `output_hidden_states`.
+
+**4. A negative position silently patches nothing.** `x[:, -1:-1+1, :]` is
 `x[:, -1:0, :]` — an empty slice. A sweep written that way returns exactly
 `0.000` at every layer, which reads as a finding. `patching.resolve_position`
 converts negative indices first.
 
-**4. An intervention that does nothing looks like a result.** The smoke test
+**5. An intervention that does nothing looks like a result.** The smoke test
 asserts a layer-0 subject patch *fully flips* the answer and a last-layer subject
 patch *does not*, so both a dead write and an overly broad one are caught.
 
@@ -223,6 +234,14 @@ uncontrolled probe number is not interpretable:
   group. `leak_score` asks "is it reading a shortcut within this distribution";
   `transfer_score` asks "does it work anywhere else". High score with low
   transfer means the probe learned the distribution, not the concept.
+- `recall_at_fpr` — recall at a threshold that allows 1% false positives on a
+  **neutral control set**, with a bootstrap CI. AUROC averages the whole curve;
+  a detector lives in the low-false-alarm corner, and a probe at AUROC 0.92 can
+  catch almost nothing at 1% FPR. The control set is a third thing: `leak` asks
+  "did it take a shortcut", `transfer` asks "does it work elsewhere",
+  control-FPR asks "how often does it fire on benign input". The threshold is a
+  quantile of the controls, so fewer than `1/fpr` of them cannot place it at
+  all — that case warns rather than returning a confident number.
 - `underdetermined` — flags `n_features >= n_train`. Residual streams are 1.5k–8k
   dimensional, so a few hundred examples are *always* linearly separable and a
   high training score is guaranteed.
@@ -252,6 +271,23 @@ truth direction @ layer 14: ||d|| = 9.404
 `Steerer(..., normalize=True)` puts the coefficient in units of the site's
 activation norm, so `coeff=0.05` means "perturb by 5%" on any model or layer.
 
+`Steerer` adds a direction; `Ablator` projects one out:
+
+```python
+with steering.Ablator(model, layer, d, coeff=1.0):   # h <- h - (h.d_hat) d_hat
+    out = model.generate(...)
+```
+
+Adding tests whether a direction *can* drive behaviour — which a direction the
+model ignores still answers yes to, if you push hard enough. Ablating tests
+whether the model *needs* it, which is the question a probe result actually
+raises. `coeff` is a fraction of the component (1.0 removes it, 0.5 halves it),
+so unlike steering there is no destructive regime to calibrate away from. Pass
+`mean_component=steering.mean_component(d, X)` to mean-ablate instead of
+zero-ablate: zeroing a component the model never zeroes moves the stream off
+distribution, so a behaviour change can mean "I broke it" rather than "it needed
+that direction".
+
 **Always sweep `steering.random_control(direction)` alongside.** In the worked
 example the matched-norm random direction degrades output *more* than the
 concept direction at 0.05-0.10 — without that column you would have read the
@@ -272,6 +308,25 @@ probe-ready rows with position offsets and rollout group ids (feed those to
 `activations.pooled(model, tok, prompts, mode=...)` supports `"last"`,
 `"mean"`, `"suffix:k"`, and `"ema:a"`. Try more than one — a probe result that
 survives only one pooling choice is a fact about the pooling.
+
+## Re-runs are the loop that costs you
+
+Two changes target the edit-run-look cycle rather than the first run:
+
+- **`--cache` on extraction.** `A.pooled(..., cache="acts/")` memoizes per prompt
+  on disk, so changing a probe's `C`, the split, or the plot re-runs the script
+  without re-running the forward passes. Keyed on the weights *as loaded* — repo
+  name, quantization, dtype — because nf4 and bf16 give different activations for
+  the same prompt, and a cache keyed on the model name alone would serve dense
+  numbers into a quantized run and never raise. Cached at the pooled boundary
+  (0.18 MB/prompt on a 1.5B, 1.3 MB on a 32B), not at `all_layers`, which is
+  seq-times larger.
+- **One donor trace per sweep.** `patching.patch_at` traces the donor *and* the
+  recipient, so sweeping it per layer re-ran the donor prompt once per layer —
+  about half the forward passes in a sweep, spent on nothing.
+  `patching.sweep_pair` reads every (layer, position) off a single donor trace.
+  A smoke check asserts it is numerically identical to the per-layer path, since
+  a state saved for the wrong layer still draws a smooth, plausible curve.
 
 ## Notes on this environment
 
