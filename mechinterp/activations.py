@@ -61,3 +61,55 @@ def assert_aligned(tok, prompt_a, prompt_b):
             f"token-count mismatch ({len(a)} vs {len(b)}):\n"
             f"  {[tok.decode([t]) for t in a]}\n  {[tok.decode([t]) for t in b]}")
     return len(a)
+
+
+# ---------------------------------------------------------------------------
+# Pooling. A single token position is one choice among several, and which one
+# you pick changes what the probe can see: the last token of a complete
+# statement has seen everything, a mean over the prompt is dominated by
+# whichever tokens are numerous, and a suffix window is the usual compromise
+# for "the model's state as it finishes reading". Try more than one -- a probe
+# result that only survives one pooling choice is a fact about the pooling.
+# ---------------------------------------------------------------------------
+
+def pool_tokens(hs, mode="last"):
+    """hs: [n_slots, seq, hidden] -> [n_slots, hidden].
+
+    mode: "last"      final token only (default)
+          "mean"      uniform mean over all positions
+          "suffix:k"  mean over the final k positions
+          "ema:a"     exponential moving average, decay a in (0, 1]; larger a
+                      weights recent tokens more heavily. a=1.0 == "last".
+    """
+    if hs.ndim != 3:
+        raise ValueError(f"expected [n_slots, seq, hidden], got {tuple(hs.shape)}")
+    seq = hs.shape[1]
+    if mode == "last":
+        return hs[:, -1, :]
+    if mode == "mean":
+        return hs.mean(dim=1)
+    if mode.startswith("suffix:"):
+        k = max(1, min(seq, int(mode.split(":", 1)[1])))
+        return hs[:, -k:, :].mean(dim=1)
+    if mode.startswith("ema:"):
+        a = float(mode.split(":", 1)[1])
+        if not 0 < a <= 1:
+            raise ValueError("ema decay must be in (0, 1]")
+        import torch as _t
+        age = _t.arange(seq - 1, -1, -1, device=hs.device, dtype=hs.dtype)
+        w = a * (1 - a) ** age
+        w = w / w.sum()
+        return (hs * w[None, :, None]).sum(dim=1)
+    raise ValueError(f"unknown pooling mode {mode!r}")
+
+
+def pooled(model, tok, prompts, mode="last", device=None):
+    """Pooled activations, every layer, for many prompts.
+
+    -> np.ndarray [n_prompts, n_layers + 1, hidden] (float32, CPU)
+    """
+    out = []
+    for p in prompts:
+        hs = all_layers(model, tok, p, device=device)
+        out.append(pool_tokens(hs, mode).float().cpu().numpy())
+    return np.stack(out)

@@ -14,6 +14,13 @@ accident. Three things go wrong in practice, in rough order of how often:
    high `leak_score` tells you the probe took it.
 3. Grouped structure leaked across the split -- e.g. multiple token positions
    from the same sentence in both train and test. Split by group, not by row.
+4. The probe works only on the distribution it was fit on. `leak_score` asks
+   "is it reading a shortcut *within* this distribution"; `transfer_score` asks
+   the different and equally easy-to-skip question "does it still work on a
+   DIFFERENT domain, category, or model". A direction fit on one distribution
+   and deployed on another is uncalibrated noise, not a weak signal -- pass
+   `transfer_X/transfer_y` from the target distribution to find out before you
+   rely on it.
 
 `shuffled_score` is the null: fit the same pipeline on permuted labels. If it is
 not near chance, the evaluation itself is broken.
@@ -40,16 +47,20 @@ def _pipeline(n_train, n_features, C=0.1, max_pca=120):
     return make_pipeline(*steps)
 
 
-def probe(X_train, y_train, X_test, y_test, leak_X=None, leak_y=None, C=0.1,
-          metric="accuracy"):
+def probe(X_train, y_train, X_test, y_test, leak_X=None, leak_y=None,
+          transfer_X=None, transfer_y=None, C=0.1, metric="accuracy"):
     """Fit a linear probe and its controls in one call.
 
     leak_X / leak_y: inputs where a shortcut feature is still present but the
     label should not follow from it. High leak_score == the probe is reading
     the shortcut. See the module docstring.
 
-    -> dict(score, shuffled_score, leak_score, chance, n_train, n_features,
-            underdetermined, per_item)
+    transfer_X / transfer_y: held-out data from a DIFFERENT domain, category,
+    or group. Low transfer_score with high score == the probe learned this
+    distribution, not the concept. Report both or neither.
+
+    -> dict(score, shuffled_score, leak_score, transfer_score, chance, n_train,
+            n_features, underdetermined, per_item)
     `per_item` is the 0/1 correctness vector on the test set (accuracy metric
     only) -- feed it to plotting.bootstrap_ci for an interval on the score.
     """
@@ -76,14 +87,19 @@ def probe(X_train, y_train, X_test, y_test, leak_X=None, leak_y=None, C=0.1,
     score, per_item = _fit_score(y_train, X_test, y_test)
     shuffled, _ = _fit_score(np.random.RandomState(0).permutation(y_train), X_test, y_test)
 
-    leak = None
-    if leak_X is not None:
+    leak = transfer = None
+    if leak_X is not None or transfer_X is not None:
         clf = _pipeline(n_train, n_features, C=C).fit(X_train, y_train)
-        leak = float((clf.predict(np.asarray(leak_X)) == np.asarray(leak_y)).mean())
+        if leak_X is not None:
+            leak = float((clf.predict(np.asarray(leak_X)) == np.asarray(leak_y)).mean())
+        if transfer_X is not None:
+            transfer = float((clf.predict(np.asarray(transfer_X))
+                              == np.asarray(transfer_y)).mean())
 
     return dict(score=float(score), shuffled_score=float(shuffled), leak_score=leak,
-                chance=chance, n_train=int(n_train), n_features=int(n_features),
-                underdetermined=bool(underdetermined), per_item=per_item)
+                transfer_score=transfer, chance=chance, n_train=int(n_train),
+                n_features=int(n_features), underdetermined=bool(underdetermined),
+                per_item=per_item)
 
 
 def grouped_split(groups, test_frac=0.3, seed=0):
@@ -100,7 +116,9 @@ def grouped_split(groups, test_frac=0.3, seed=0):
 
 def format_result(r, label=""):
     lead = f"{label:<16}" if label else ""
-    leak = "  leak=  n/a" if r["leak_score"] is None else f"  leak={r['leak_score']:6.3f}"
+    leak = "  leak=  n/a" if r.get("leak_score") is None else f"  leak={r['leak_score']:6.3f}"
+    tr = ("" if r.get("transfer_score") is None
+          else f"  transfer={r['transfer_score']:6.3f}")
     flag = "  [UNDERDETERMINED]" if r["underdetermined"] else ""
     return (f"{lead}score={r['score']:6.3f}  shuffled={r['shuffled_score']:6.3f}"
-            f"  chance={r['chance']:5.3f}{leak}{flag}")
+            f"  chance={r['chance']:5.3f}{leak}{tr}{flag}")

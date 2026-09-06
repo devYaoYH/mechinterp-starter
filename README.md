@@ -25,8 +25,9 @@ your experiment, not your environment. Run it again after any dependency bump.
 ## What's here
 
 ```
-smoke_test.py             11 checks over the whole stack -- run this first
+smoke_test.py             16 checks over the whole stack -- run this first
 example_causal_trace.py   worked example: layer sweep, two positions, 30 pairs
+example_steering.py       worked example: direction -> calibrate -> steer + control
 template_new_task.py      full arc for a fresh question: probe -> intervene -> plot
 quantize_model.py         4-bit quantize + save + fidelity report
 mechinterp/loading.py     model loading; the bf16 / nf4 / prequantized branch
@@ -35,6 +36,8 @@ mechinterp/patching.py    cross-run patching + the normalized effect metric
 mechinterp/readout.py     logit lens
 mechinterp/probing.py     linear probe with shuffled null, leak test, split
 mechinterp/plotting.py    three figure forms with CI bands and reference lines
+mechinterp/steering.py    concept directions, coefficient calibration, steering hook
+mechinterp/rollout.py     activations from sampled generation, not one forward pass
 mechinterp/quantization.py  quantize, persist, and measure fidelity vs dense
 .claude/skills/           /fit-probe /run-intervention /report-figure /quantize-model
 setup.sh                  GPU-arch-aware bootstrap
@@ -135,6 +138,10 @@ uncontrolled probe number is not interpretable:
   country was mentioned"; when the label is a deterministic function of something
   trivially in the input, the two are the same partition and the probe proves
   nothing.
+- `transfer_score` — the probe applied to a *different* domain, category, or
+  group. `leak_score` asks "is it reading a shortcut within this distribution";
+  `transfer_score` asks "does it work anywhere else". High score with low
+  transfer means the probe learned the distribution, not the concept.
 - `underdetermined` — flags `n_features >= n_train`. Residual streams are 1.5k–8k
   dimensional, so a few hundred examples are *always* linearly separable and a
   high training score is guaranteed.
@@ -145,6 +152,45 @@ Also worth doing and not automated here: check that a probe generalizes across
 categories (train on one fact type, test on another), and compare against the
 model's own output probability for the target — often a trained probe is just
 reading token surprisal.
+
+## Steering: calibrate before you pick a coefficient
+
+A raw coefficient is meaningless until you know it relative to the residual
+stream where it lands. `steering.calibrate(direction, site_activations)` reports
+the direction's norm as a fraction of the site's typical activation norm, and
+tells you the coefficient for a target perturbation:
+
+```
+truth direction @ layer 14: ||d|| = 9.404
+  site ||h||: median 55.341 (p10 53.217, p90 57.593)
+  coeff=1.0 perturbs by 17.0% of median ||h||
+  for a target perturbation, use coeff:  1%:0.0589  5%:0.294  10%:0.589  25%:1.47
+  WARNING: a raw-coefficient sweep starting at 1.0 begins in the destructive regime
+```
+
+`Steerer(..., normalize=True)` puts the coefficient in units of the site's
+activation norm, so `coeff=0.05` means "perturb by 5%" on any model or layer.
+
+**Always sweep `steering.random_control(direction)` alongside.** In the worked
+example the matched-norm random direction degrades output *more* than the
+concept direction at 0.05-0.10 — without that column you would have read the
+concept effect as meaningful.
+
+## Rollouts: the distribution a live intervention actually sees
+
+`activations.py` assumes one deterministic forward pass. A direction fit on the
+last token of a *complete* statement and deployed on the last token of an
+*in-progress* phrase is a train/deploy mismatch, and behaves as noise.
+`rollout.sample_rollouts()` captures per-step activations during sampled
+generation with an auto-verifier label, and `stack_steps()` flattens them into
+probe-ready rows with position offsets and rollout group ids (feed those to
+`grouped_split` so one rollout's tokens can't straddle the split).
+
+## Pooling
+
+`activations.pooled(model, tok, prompts, mode=...)` supports `"last"`,
+`"mean"`, `"suffix:k"`, and `"ema:a"`. Try more than one — a probe result that
+survives only one pooling choice is a fact about the pooling.
 
 ## Notes on this environment
 

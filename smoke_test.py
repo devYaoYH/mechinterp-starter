@@ -184,6 +184,97 @@ def main():
 
     check("underdetermined regime is flagged", underdetermined_warning)
 
+    print(f"\n=== pooling, directions, steering, rollouts ===")
+
+    def pooling():
+        from mechinterp import activations as _A
+        hs = _A.all_layers(model, tok, "The capital of France is")
+        shapes = {m: _A.pool_tokens(hs, m).shape for m in
+                  ("last", "mean", "suffix:3", "ema:0.5")}
+        assert len({s for s in shapes.values()}) == 1, shapes
+        # ema with decay 1.0 puts all weight on the final token.
+        assert torch.allclose(_A.pool_tokens(hs, "ema:1.0"), _A.pool_tokens(hs, "last"),
+                              atol=1e-2), "ema:1.0 should equal last-token pooling"
+        assert not torch.allclose(_A.pool_tokens(hs, "mean"), _A.pool_tokens(hs, "last"))
+        return f"4 modes -> {tuple(shapes['last'])}, ema:1.0 == last"
+
+    check("token pooling modes", pooling)
+
+    def calibration():
+        from mechinterp import steering
+        rng = np.random.RandomState(0)
+        acts = rng.randn(64, 128) * 3.0            # ||h|| ~ sqrt(128)*3 ~ 34
+        y = (rng.rand(64) > 0.5).astype(int)
+        d = steering.difference_of_means(acts, y)
+        cal = steering.calibrate(d, acts)
+        ratio = cal["direction_norm"] / cal["activation_norm_median"]
+        assert abs(cal["perturbation_at_coeff_1"] - ratio) < 1e-6
+        # coeff_for[f] must actually produce a perturbation of f.
+        for f, c in cal["coeff_for"].items():
+            assert abs(c * ratio - f) < 1e-6, f"coeff_for[{f}] wrong"
+        big = steering.calibrate(d * 50, acts)
+        assert big["warning"] is not None, "no warning on an oversized direction"
+        r = steering.random_control(d)
+        assert abs(np.linalg.norm(r) - np.linalg.norm(d)) < 1e-6, "control norm mismatch"
+        return (f"coeff=1 -> {cal['perturbation_at_coeff_1']:.1%} of ||h||; "
+                "warning fires; random control norm-matched")
+
+    check("steering calibration math", calibration)
+
+    def steerer():
+        from mechinterp import steering
+        ids = tok("The capital of France is", return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            base = model(**ids).logits[0, -1].clone()
+        d = np.ones(base.shape[0] * 0 + model.config.hidden_size)
+        with steering.Steerer(model, 5, d, 0.0):          # coeff 0 == no-op
+            with torch.no_grad():
+                zero = model(**ids).logits[0, -1]
+        assert torch.allclose(base, zero), "coeff=0 changed the output"
+        with steering.Steerer(model, 5, d, 0.5, normalize=True, site_norm=50.0):
+            with torch.no_grad():
+                moved = model(**ids).logits[0, -1]
+        assert not torch.allclose(base, moved), "steering had no effect"
+        # hook must be removed on context exit
+        with torch.no_grad():
+            after = model(**ids).logits[0, -1]
+        assert torch.allclose(base, after), "hook leaked past the with-block"
+        return "coeff=0 no-op, coeff>0 moves logits, hook removed on exit"
+
+    check("steering hook lands and is removed", steerer)
+
+    def rollouts():
+        from mechinterp import rollout
+        rs = rollout.sample_rollouts(
+            model, tok, ["The capital of France is"], max_new_tokens=6,
+            n_samples=2, temperature=0.8, verifier=rollout.contains("Paris"))
+        assert len(rs) == 2
+        for r in rs:
+            assert r.acts.shape[0] == len(r.token_ids), \
+                f"acts {r.acts.shape} misaligned with {len(r.token_ids)} tokens"
+            assert r.acts.shape[1] == NL + 1, f"expected {NL+1} slots"
+            assert r.correct is not None
+        X, y, pos, grp = rollout.stack_steps(rs, layer=5, relative_to="end")
+        assert X.shape[0] == len(y) == len(pos) == len(grp)
+        assert pos.max() < 0, "relative_to='end' offsets should be negative"
+        return f"{len(rs)} rollouts, acts aligned to tokens, {X.shape[0]} probe rows"
+
+    check("sampled rollouts capture aligned activations", rollouts)
+
+    def transfer_control():
+        rng = np.random.RandomState(3)
+        X = rng.randn(200, 32); y = (X[:, 0] > 0).astype(int)
+        Xb = rng.randn(80, 32); yb = (Xb[:, 1] > 0).astype(int)   # different feature
+        r = probing.probe(X[:140], y[:140], X[140:], y[140:],
+                          transfer_X=Xb, transfer_y=yb)
+        assert r["transfer_score"] is not None
+        assert r["score"] > 0.8 and r["transfer_score"] < 0.7, \
+            f"transfer control did not separate: {r['score']:.3f}/{r['transfer_score']:.3f}"
+        return (f"in-domain {r['score']:.3f} vs out-of-domain "
+                f"{r['transfer_score']:.3f}")
+
+    check("cross-domain transfer control", transfer_control)
+
     print(f"\n=== figures ===")
 
     def figures_render():
