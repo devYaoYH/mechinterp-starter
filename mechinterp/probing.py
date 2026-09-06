@@ -1,29 +1,23 @@
 """Linear probing, with the controls attached to the measurement.
 
-The API deliberately returns the probe score and its controls together, because
-an uncontrolled probe number is not interpretable and is very easy to report by
-accident. Three things go wrong in practice, in rough order of how often:
+`probe()` returns the score together with its controls, because an uncontrolled
+probe number is not interpretable. What goes wrong, in rough order of frequency:
 
-1. n_train < n_features. Residual streams are 1.5k-8k dimensional; a few hundred
-   examples are ALWAYS linearly separable, so a high score means nothing.
-   `probe()` warns when you are in that regime.
-2. The label is a deterministic function of something trivially present in the
-   input. A probe for "which capital is coming" scores well by decoding "which
-   country was mentioned" -- no retrieval required. Pass `leak_X/leak_y` with
-   examples where the shortcut is present but the label should NOT follow, and a
-   high `leak_score` tells you the probe took it.
-3. Grouped structure leaked across the split -- e.g. multiple token positions
-   from the same sentence in both train and test. Split by group, not by row.
-4. The probe works only on the distribution it was fit on. `leak_score` asks
-   "is it reading a shortcut *within* this distribution"; `transfer_score` asks
-   the different and equally easy-to-skip question "does it still work on a
-   DIFFERENT domain, category, or model". A direction fit on one distribution
-   and deployed on another is uncalibrated noise, not a weak signal -- pass
-   `transfer_X/transfer_y` from the target distribution to find out before you
-   rely on it.
+1. n_features >= n_train. Residual streams are 1.5k-8k dimensional; a few hundred
+   examples are ALWAYS separable, so a high training score is guaranteed.
+   -> `underdetermined` flag.
+2. The label is a deterministic function of something trivially in the input.
+   "Which capital is coming" is the same label partition as "which country was
+   mentioned", so a probe scores ~100% at layer 0 having retrieved nothing.
+   -> `leak_score`: inputs where the shortcut is present but the label should not
+   follow. High == the probe took it.
+3. The probe only works on the distribution it was fit on.
+   -> `transfer_score`: held-out data from a different domain/category/group.
+4. Grouped structure straddling the split (token positions from one sentence on
+   both sides). -> `grouped_split`, by item id, never by row.
 
-`shuffled_score` is the null: fit the same pipeline on permuted labels. If it is
-not near chance, the evaluation itself is broken.
+`shuffled_score` is the null: same pipeline, permuted labels. If it is not near
+chance, the evaluation itself is broken.
 """
 import warnings
 
@@ -37,88 +31,71 @@ from sklearn.preprocessing import StandardScaler
 
 def _pipeline(n_train, n_features, C=0.1, max_pca=120):
     """StandardScaler is not optional: residual streams have a few huge-norm
-    outlier dimensions, and unscaled features make C mean something different
-    per dimension. PCA keeps the fit fast and cannot lose signal a linear probe
-    could have used, since the data already spans <= n_train dimensions."""
-    steps = [StandardScaler()]
-    n_comp = min(max_pca, max(2, n_train - 1), n_features)
-    steps.append(PCA(n_components=n_comp, random_state=0))
-    steps.append(LogisticRegression(max_iter=3000, C=C))
-    return make_pipeline(*steps)
+    dimensions, and unscaled features make C mean something different per
+    dimension. PCA keeps fits fast and loses nothing a linear probe could use,
+    since the data already spans <= n_train dimensions."""
+    return make_pipeline(
+        StandardScaler(),
+        PCA(n_components=min(max_pca, max(2, n_train - 1), n_features), random_state=0),
+        LogisticRegression(max_iter=3000, C=C))
 
 
 def probe(X_train, y_train, X_test, y_test, leak_X=None, leak_y=None,
           transfer_X=None, transfer_y=None, C=0.1, metric="accuracy"):
-    """Fit a linear probe and its controls in one call.
+    """-> dict(score, shuffled_score, leak_score, transfer_score, chance,
+              n_train, n_features, underdetermined, per_item)
 
-    leak_X / leak_y: inputs where a shortcut feature is still present but the
-    label should not follow from it. High leak_score == the probe is reading
-    the shortcut. See the module docstring.
-
-    transfer_X / transfer_y: held-out data from a DIFFERENT domain, category,
-    or group. Low transfer_score with high score == the probe learned this
-    distribution, not the concept. Report both or neither.
-
-    -> dict(score, shuffled_score, leak_score, transfer_score, chance, n_train,
-            n_features, underdetermined, per_item)
     `per_item` is the 0/1 correctness vector on the test set (accuracy metric
-    only) -- feed it to plotting.bootstrap_ci for an interval on the score.
+    only); feed it to plotting.bootstrap_ci for an interval on the score.
     """
     X_train, X_test = np.asarray(X_train), np.asarray(X_test)
     y_train, y_test = np.asarray(y_train), np.asarray(y_test)
     n_train, n_features = X_train.shape
-    classes = np.unique(y_train)
-    chance = 1.0 / len(classes) if metric == "accuracy" else 0.5
+    chance = 1.0 / len(np.unique(y_train)) if metric == "accuracy" else 0.5
 
     underdetermined = n_features >= n_train
     if underdetermined:
-        warnings.warn(
-            f"n_features ({n_features}) >= n_train ({n_train}): the training set "
-            f"is always linearly separable in this regime, so treat the held-out "
-            f"score as the only meaningful number and expect it to be noisy.",
-            stacklevel=2)
+        warnings.warn(f"n_features ({n_features}) >= n_train ({n_train}): the training "
+                      f"set is always separable here, so the held-out score is the only "
+                      f"meaningful number, and it will be noisy.", stacklevel=2)
 
-    def _fit_score(ytr, Xte, yte):
-        clf = _pipeline(n_train, n_features, C=C).fit(X_train, ytr)
+    def fit_score(ytr):
+        clf = _pipeline(n_train, n_features, C).fit(X_train, ytr)
         if metric == "auroc":
-            return roc_auc_score(yte, clf.predict_proba(Xte)[:, 1]), None
-        return clf.score(Xte, yte), (clf.predict(Xte) == yte).astype(float)
+            return roc_auc_score(y_test, clf.predict_proba(X_test)[:, 1]), None, clf
+        return clf.score(X_test, y_test), (clf.predict(X_test) == y_test).astype(float), clf
 
-    score, per_item = _fit_score(y_train, X_test, y_test)
-    shuffled, _ = _fit_score(np.random.RandomState(0).permutation(y_train), X_test, y_test)
+    score, per_item, clf = fit_score(y_train)
+    shuffled, _, _ = fit_score(np.random.RandomState(0).permutation(y_train))
 
-    leak = transfer = None
-    if leak_X is not None or transfer_X is not None:
-        clf = _pipeline(n_train, n_features, C=C).fit(X_train, y_train)
-        if leak_X is not None:
-            leak = float((clf.predict(np.asarray(leak_X)) == np.asarray(leak_y)).mean())
-        if transfer_X is not None:
-            transfer = float((clf.predict(np.asarray(transfer_X))
-                              == np.asarray(transfer_y)).mean())
+    def apply(Xo, yo):
+        return None if Xo is None else float(
+            (clf.predict(np.asarray(Xo)) == np.asarray(yo)).mean())
 
-    return dict(score=float(score), shuffled_score=float(shuffled), leak_score=leak,
-                transfer_score=transfer, chance=chance, n_train=int(n_train),
-                n_features=int(n_features), underdetermined=bool(underdetermined),
-                per_item=per_item)
+    return dict(score=float(score), shuffled_score=float(shuffled),
+                leak_score=apply(leak_X, leak_y),
+                transfer_score=apply(transfer_X, transfer_y),
+                chance=chance, n_train=int(n_train), n_features=int(n_features),
+                underdetermined=bool(underdetermined), per_item=per_item)
 
 
 def grouped_split(groups, test_frac=0.3, seed=0):
-    """Split by group id, never by row. Use the example/sentence/template id as
-    the group so the same underlying item cannot appear on both sides."""
+    """Split by group id, never by row -> (train_mask, test_mask)."""
     groups = np.asarray(groups)
     uniq = np.unique(groups)
-    rng = np.random.RandomState(seed)
-    rng.shuffle(uniq)
+    np.random.RandomState(seed).shuffle(uniq)
     test = set(uniq[:max(1, int(len(uniq) * test_frac))].tolist())
-    is_test = np.array([g in test for g in groups])
+    is_test = np.isin(groups, list(test))
     return ~is_test, is_test
 
 
 def format_result(r, label=""):
-    lead = f"{label:<16}" if label else ""
-    leak = "  leak=  n/a" if r.get("leak_score") is None else f"  leak={r['leak_score']:6.3f}"
-    tr = ("" if r.get("transfer_score") is None
-          else f"  transfer={r['transfer_score']:6.3f}")
-    flag = "  [UNDERDETERMINED]" if r["underdetermined"] else ""
-    return (f"{lead}score={r['score']:6.3f}  shuffled={r['shuffled_score']:6.3f}"
-            f"  chance={r['chance']:5.3f}{leak}{tr}{flag}")
+    parts = [f"{label:<16}" if label else "",
+             f"score={r['score']:6.3f}  shuffled={r['shuffled_score']:6.3f}",
+             f"  chance={r['chance']:5.3f}"]
+    for key, name in (("leak_score", "leak"), ("transfer_score", "transfer")):
+        if r.get(key) is not None:
+            parts.append(f"  {name}={r[key]:6.3f}")
+    if r["underdetermined"]:
+        parts.append("  [UNDERDETERMINED]")
+    return "".join(parts)

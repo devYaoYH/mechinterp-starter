@@ -1,316 +1,253 @@
-"""Verify the whole stack before writing any research code.
+"""Verify the whole stack before writing research code.
 
-Every check here corresponds to a failure that actually happens on a fresh box
-or a library bump, and several of them fail SILENTLY -- producing plausible
-numbers rather than an exception. Run this first on any new instance, and again
-after any dependency upgrade.
+Every check corresponds to a failure that actually happens on a fresh box or a
+library bump, and most of them fail SILENTLY -- producing plausible numbers
+rather than an exception. Run first on any new instance, and after any upgrade.
 
     python smoke_test.py [--model ID] [--quant none|nf4|prequantized]
 """
-import argparse
 import sys
+import warnings
 
 import numpy as np
 import torch
 
 from mechinterp import activations as A
-from mechinterp import loading, patching, probing, readout
+from mechinterp import loading, patching, plotting, probing, readout, rollout, steering
 
-OK, BAD = "  ok  ", " FAIL "
-failures = []
+CHECKS = []
 
 
-def check(name, fn):
+def check(section):
+    def register(fn):
+        CHECKS.append((section, fn))
+        return fn
+    return register
+
+
+# --------------------------------------------------------------- environment
+@check("environment")
+def gpu_kernels_run(c):
+    """Blackwell trap: an old CUDA wheel imports fine and reports the device
+    correctly, then dies on the first real kernel."""
+    assert torch.cuda.is_available(), "no CUDA device visible"
+    x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+    (x @ x).sum().item()
+    cc = torch.cuda.get_device_capability()
+    return f"{torch.cuda.get_device_name()}, cc {cc[0]}.{cc[1]}, torch {torch.__version__}"
+
+
+# ---------------------------------------------------------------- extraction
+@check("extraction")
+def hidden_state_indexing(c):
+    hs = A.all_layers(c["model"], c["tok"], c["prompt"])
+    assert hs.shape[0] == c["NL"] + 1, f"expected {c['NL']+1} slots, got {hs.shape[0]}"
+    X = A.at_position(c["model"], c["tok"], [c["prompt"], c["corrupt"]])
+    assert X.shape[:2] == (2, c["NL"] + 1) and np.isfinite(X).all()
+    return f"hs = [{c['NL']}+1, seq={hs.shape[1]}, hid={hs.shape[2]}], finite"
+
+
+@check("extraction")
+def pooling_modes(c):
+    hs = A.all_layers(c["model"], c["tok"], c["prompt"])
+    shapes = {m: A.pool_tokens(hs, m).shape for m in ("last", "mean", "suffix:3", "ema:0.5")}
+    assert len(set(shapes.values())) == 1, shapes
+    assert torch.allclose(A.pool_tokens(hs, "ema:1.0"), A.pool_tokens(hs, "last"), atol=1e-2)
+    assert not torch.allclose(A.pool_tokens(hs, "mean"), A.pool_tokens(hs, "last"))
+    return f"4 modes -> {tuple(shapes['last'])}, ema:1.0 == last"
+
+
+@check("extraction")
+def alignment_and_lookup(c):
+    n = A.assert_aligned(c["tok"], c["prompt"], c["corrupt"])
+    return f"{n} tokens, subject at index {A.token_index(c['tok'], c['prompt'], 'France')}"
+
+
+@check("extraction")
+def logit_lens_matches_model(c):
+    """hs[-1] has ALREADY had the final norm applied; norming twice returns
+    confident nonsense rather than raising."""
+    hs = A.all_layers(c["model"], c["tok"], c["prompt"])
+    top = readout.top_k(c["tok"], readout.lens_at(c["model"], hs, c["NL"]), 1)[0][0]
+    assert top.strip() == "Paris", f"final-slot lens gave {top!r}, expected ' Paris'"
+    mid = readout.top_k(c["tok"], readout.lens_at(c["model"], hs, c["NL"] - 1), 1)[0][0]
+    return f"final slot -> {top!r}; penultimate -> {mid!r}"
+
+
+# -------------------------------------------------------------- intervention
+@check("intervention")
+def nnsight_api_shapes(c):
+    """nnsight>=0.7 .save() yields a realized tensor; transformers>=5 layer
+    .output is the hidden_states tensor, not a (tensor,) tuple."""
+    with torch.no_grad(), c["nn"].trace(c["prompt"]):
+        out = c["nn"].model.layers[0].output.save()
+    assert isinstance(out, torch.Tensor) and out.ndim == 3, type(out)
+    return f"layer.output is a Tensor {tuple(out.shape)}"
+
+
+@check("intervention")
+def patch_lands_and_is_localized(c):
+    """A patch that silently does nothing returns plausible numbers -- an
+    all-zero curve reads as a finding. Assert it moves the logits, and that
+    position=-1 does not become the empty slice x[:, -1:0, :]."""
+    nn, tok, NL = c["nn"], c["tok"], c["NL"]
+    ida = tok(" Paris", add_special_tokens=False)["input_ids"][0]
+    idb = tok(" Berlin", add_special_tokens=False)["input_ids"][0]
+    idx = A.token_index(tok, c["prompt"], "France")
+    clean = patching.baseline_logits(nn, c["prompt"])
+    corr = patching.baseline_logits(nn, c["corrupt"])
+    assert tok.decode([int(clean.argmax())]).strip() == "Paris"
+    assert tok.decode([int(corr.argmax())]).strip() == "Berlin"
+
+    def eff(layer, pos):
+        return patching.normalized_effect(
+            clean, corr, patching.patch_at(nn, c["corrupt"], c["prompt"], layer, pos), ida, idb)
+
+    e0, eL, eN = eff(0, idx), eff(NL - 1, idx), eff(NL - 1, -1)
+    assert e0 > 0.9, f"layer-0 subject patch {e0:.3f}, expected ~1.0 (write not landing?)"
+    assert eL < 0.2, f"last-layer subject patch {eL:.3f}, expected ~0 (patching too much?)"
+    assert eN > 0.9, f"position=-1 patch {eN:.3f}, expected ~1.0 (empty slice?)"
+    return f"subject L0={e0:.3f}, subject L{NL-1}={eL:.3f}, final L{NL-1}={eN:.3f}"
+
+
+# ------------------------------------------------------------------ steering
+@check("steering")
+def calibration_math(c):
+    rng = np.random.RandomState(0)
+    acts = rng.randn(64, 128) * 3.0
+    d = steering.difference_of_means(acts, (rng.rand(64) > 0.5).astype(int))
+    cal = steering.calibrate(d, acts)
+    ratio = cal["direction_norm"] / cal["activation_norm_median"]
+    assert abs(cal["perturbation_at_coeff_1"] - ratio) < 1e-6
+    for f, coeff in cal["coeff_for"].items():
+        assert abs(coeff * ratio - f) < 1e-6, f"coeff_for[{f}] wrong"
+    assert steering.calibrate(d * 50, acts)["warning"], "no warning on oversized direction"
+    r = steering.random_control(d)
+    assert abs(np.linalg.norm(r) - np.linalg.norm(d)) < 1e-6, "control norm mismatch"
+    return f"coeff=1 -> {ratio:.1%} of ||h||; warning fires; control norm-matched"
+
+
+@check("steering")
+def hook_lands_and_is_removed(c):
+    model, ids = c["model"], c["tok"](c["prompt"], return_tensors="pt").to(c["model"].device)
+    with torch.no_grad():
+        base = model(**ids).logits[0, -1].clone()
+    d = np.ones(model.config.hidden_size)
+    with steering.Steerer(model, 5, d, 0.0):
+        with torch.no_grad():
+            assert torch.allclose(base, model(**ids).logits[0, -1]), "coeff=0 changed output"
+    with steering.Steerer(model, 5, d, 0.5, site_norm=50.0):
+        with torch.no_grad():
+            assert not torch.allclose(base, model(**ids).logits[0, -1]), "steering did nothing"
+    with torch.no_grad():
+        assert torch.allclose(base, model(**ids).logits[0, -1]), "hook leaked past with-block"
+    return "coeff=0 no-op, coeff>0 moves logits, hook removed on exit"
+
+
+@check("steering")
+def rollouts_align_to_tokens(c):
+    rs = rollout.sample_rollouts(c["model"], c["tok"], [c["prompt"]], max_new_tokens=6,
+                                 n_samples=2, temperature=0.8,
+                                 verifier=rollout.contains("Paris"))
+    for r in rs:
+        assert r.acts.shape[0] == len(r.token_ids), f"{r.acts.shape} vs {len(r.token_ids)}"
+        assert r.acts.shape[1] == c["NL"] + 1 and r.correct is not None
+    X, y, pos, grp = rollout.stack_steps(rs, layer=5, relative_to="end")
+    assert len(X) == len(y) == len(pos) == len(grp) and pos.max() < 0
+    return f"{len(rs)} rollouts, acts aligned, {len(X)} probe rows"
+
+
+# ------------------------------------------------------------------- probing
+@check("probing")
+def probe_and_null(c):
+    rng = np.random.RandomState(0)
+    X = rng.randn(200, 64)
+    y = (X[:, 0] > 0).astype(int)
+    tr, te = probing.grouped_split(np.arange(200) // 2)
+    r = probing.probe(X[tr], y[tr], X[te], y[te])
+    assert r["score"] > 0.8, f"probe failed on separable data: {r['score']:.3f}"
+    assert r["shuffled_score"] < 0.7, f"shuffled null too high: {r['shuffled_score']:.3f}"
+    return probing.format_result(r).strip()
+
+
+@check("probing")
+def leak_and_transfer_controls(c):
+    rng = np.random.RandomState(1)
+    X = rng.randn(200, 32)
+    y = (X[:, 0] > 0).astype(int)
+    Xb = rng.randn(80, 32)
+    yb = (Xb[:, 1] > 0).astype(int)          # a different feature entirely
+    r = probing.probe(X[:140], y[:140], X[140:], y[140:],
+                      leak_X=X[140:], leak_y=1 - y[140:], transfer_X=Xb, transfer_y=yb)
+    assert r["leak_score"] < 0.3, f"leak control did not register: {r['leak_score']}"
+    assert r["score"] > 0.8 > r["transfer_score"], "transfer control did not separate"
+    return f"leak={r['leak_score']:.3f}, in-domain {r['score']:.3f} vs transfer {r['transfer_score']:.3f}"
+
+
+@check("probing")
+def underdetermined_is_flagged(c):
+    rng = np.random.RandomState(2)
+    X, y = rng.randn(40, 512), rng.randint(0, 2, 40)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        r = probing.probe(X[:28], y[:28], X[28:], y[28:])
+    assert r["underdetermined"] and any("n_features" in str(x.message) for x in w)
+    return "n_features >= n_train is flagged"
+
+
+# ------------------------------------------------------------------- figures
+@check("figures")
+def figures_render_headless(c):
+    import os
+    import tempfile
+    rng = np.random.RandomState(0)
+    depths = [100 * i / 12 for i in range(12)]
+    per_layer = [list(rng.rand(8)) for _ in range(12)]
+    with tempfile.TemporaryDirectory() as td:
+        plotting.save(plotting.layer_sweep({"a": per_layer, "b": per_layer},
+                                           depths, "t", n=8).figure, f"{td}/a.png")
+        plotting.save(plotting.probe_panel(depths, per_layer, [0.1] * 12, 0.1, "t",
+                                           n=8, leak=[0.2] * 12).figure, f"{td}/b.png")
+        plotting.save(plotting.effect_grid(rng.rand(2, 12), ["x", "y"], depths, "t", n=8)[0],
+                      f"{td}/c.png")
+        sizes = [os.path.getsize(f"{td}/{f}.png") for f in "abc"]
+    assert all(s > 5000 for s in sizes), f"suspiciously small renders: {sizes}"
     try:
-        detail = fn()
-        print(f"[{OK}] {name}" + (f" -- {detail}" if detail else ""))
-        return True
-    except Exception as e:
-        print(f"[{BAD}] {name} -- {type(e).__name__}: {e}")
-        failures.append(name)
-        return False
+        plotting.layer_sweep({str(i): per_layer for i in range(4)}, depths, "t")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("4-series cap not enforced")
+    return f"3 forms render ({', '.join(f'{s//1024}kB' for s in sizes)}), cap enforced"
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="Qwen/Qwen2.5-1.5B-Instruct")
-    ap.add_argument("--quant", default="none", choices=loading.QUANT_MODES)
-    args = ap.parse_args()
-
-    print(f"\n=== environment ===")
-
-    def gpu():
-        assert torch.cuda.is_available(), "no CUDA device visible"
-        cc = torch.cuda.get_device_capability()
-        name = torch.cuda.get_device_name()
-        # The Blackwell trap: an old CUDA wheel imports fine and reports the
-        # device correctly, then dies on the first real kernel.
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-        _ = (x @ x).sum().item()
-        return f"{name}, cc {cc[0]}.{cc[1]}, torch {torch.__version__}, matmul ok"
-
-    if not check("GPU present and kernels actually run", gpu):
-        print("\nStop here: fix the torch/CUDA build before anything else.")
-        sys.exit(1)
-
-    print(f"\n=== model: {args.model} (quant={args.quant}) ===")
-    model, tok = loading.load_hf(args.model, args.quant)
-    NL = loading.n_layers(model)
-    print(f"loaded, {NL} decoder layers")
-
-    prompt = "The capital of France is"
-    corrupt = "The capital of Germany is"
-
-    def hidden_shape():
-        hs = A.all_layers(model, tok, prompt)
-        assert hs.shape[0] == NL + 1, f"expected {NL+1} hidden states, got {hs.shape[0]}"
-        return f"hidden_states = [{NL}+1, seq={hs.shape[1]}, hid={hs.shape[2]}]"
-
-    check("output_hidden_states indexing (hs[L+1] == layer L)", hidden_shape)
-
-    def extract():
-        X = A.at_position(model, tok, [prompt, corrupt], position=-1)
-        assert X.shape[0] == 2 and X.shape[1] == NL + 1
-        assert np.isfinite(X).all(), "non-finite activations"
-        return f"[n=2, layers={X.shape[1]}, hid={X.shape[2]}], finite"
-
-    check("activation extraction at a position", extract)
-
-    def align():
-        n = A.assert_aligned(tok, prompt, corrupt)
-        i = A.token_index(tok, prompt, "France")
-        return f"{n} tokens, subject at index {i}"
-
-    check("token alignment + subject lookup", align)
-
-    def lens():
-        hs = A.all_layers(model, tok, prompt)
-        lg = readout.lens_at(model, hs, NL)   # slot NL == final, already normed
-        top = readout.top_k(tok, lg, 1)[0][0]
-        assert top.strip() == "Paris", f"final-layer logit lens gave {top!r}, expected ' Paris'"
-        mid = readout.top_k(tok, readout.lens_at(model, hs, NL - 1), 1)[0][0]
-        return f"final slot -> {top!r}; penultimate slot -> {mid!r}"
-
-    check("logit lens agrees with the model's own output", lens)
-
-    # ---- nnsight: API drift + the silent-no-op patch ----
-    print(f"\n=== interventions ===")
-    nn = loading.load_nnsight(args.model, args.quant)
-
-    def nnsight_api():
-        # nnsight >= 0.7: .save() yields the realized tensor outside trace()
-        # (older tutorials use .value). transformers >= 5: a decoder layer's
-        # .output is the hidden_states tensor, NOT a (tensor,) tuple.
-        with torch.no_grad(), nn.trace(prompt):
-            out = nn.model.layers[0].output.save()
-        assert isinstance(out, torch.Tensor), f"layer .output is {type(out)}, not a Tensor"
-        assert out.ndim == 3, f"expected [batch, seq, hid], got {tuple(out.shape)}"
-        return f"layer.output is a Tensor {tuple(out.shape)}"
-
-    check("nnsight/transformers API shapes", nnsight_api)
-
-    def patch_does_something():
-        """The important one. A patch that silently does nothing returns
-        perfectly plausible numbers -- an all-zero effect curve looks like a
-        finding. Assert the intervention actually moves the logits."""
-        id_p = tok(" Paris", add_special_tokens=False)["input_ids"][0]
-        id_b = tok(" Berlin", add_special_tokens=False)["input_ids"][0]
-        idx = A.token_index(tok, prompt, "France")
-        clean = patching.baseline_logits(nn, prompt)
-        corr = patching.baseline_logits(nn, corrupt)
-        assert tok.decode([int(clean.argmax())]).strip() == "Paris"
-        assert tok.decode([int(corr.argmax())]).strip() == "Berlin"
-        # Patching the subject at layer 0 == swapping the input token, so this
-        # must fully flip. If it does not, the write is not landing.
-        p0 = patching.patch_at(nn, corrupt, prompt, 0, idx)
-        e0 = patching.normalized_effect(clean, corr, p0, id_p, id_b)
-        assert e0 > 0.9, f"layer-0 subject patch had effect {e0:.3f}, expected ~1.0 (write not landing?)"
-        # And the last layer must NOT flip -- if everything flips, you are
-        # probably patching the whole run rather than one site.
-        pl = patching.patch_at(nn, corrupt, prompt, NL - 1, idx)
-        el = patching.normalized_effect(clean, corr, pl, id_p, id_b)
-        assert el < 0.2, f"last-layer subject patch had effect {el:.3f}, expected ~0 (patching too much?)"
-        # Negative positions must resolve to absolute indices: x[:, -1:0, :] is
-        # an EMPTY slice, so a position=-1 patch silently writes nothing and the
-        # whole sweep reads exactly 0.000. Patching the final token at the last
-        # layer must flip the answer.
-        pn = patching.patch_at(nn, corrupt, prompt, NL - 1, -1)
-        en = patching.normalized_effect(clean, corr, pn, id_p, id_b)
-        assert en > 0.9, f"position=-1 patch had effect {en:.3f}, expected ~1.0 (empty slice?)"
-        return (f"subject L0={e0:.3f} (flips), subject L{NL-1}={el:.3f} (no-op), "
-                f"final L{NL-1}={en:.3f} via position=-1")
-
-    check("patching actually changes the output (and not everywhere)", patch_does_something)
-
-    # ---- probing harness + its controls ----
-    print(f"\n=== probing harness ===")
-
-    def probe_controls():
-        rng = np.random.RandomState(0)
-        # Separable synthetic data: probe should win, shuffled control should not.
-        X = rng.randn(200, 64)
-        y = (X[:, 0] > 0).astype(int)          # fully determined by one feature
-        tr, te = probing.grouped_split(np.arange(200) // 2, test_frac=0.3)
-        r = probing.probe(X[tr], y[tr], X[te], y[te])
-        assert r["score"] > 0.85, f"probe failed on separable data: {r['score']:.3f}"
-        assert r["shuffled_score"] < 0.7, f"shuffled control too high: {r['shuffled_score']:.3f}"
-        return probing.format_result(r).strip()
-
-    check("probe wins on signal, shuffled null does not", probe_controls)
-
-    def probe_detects_leak():
-        rng = np.random.RandomState(1)
-        X = rng.randn(200, 64)
-        y = (X[:, 0] > 0).astype(int)
-        # Leak set: same shortcut feature, labels deliberately inverted.
-        r = probing.probe(X[:140], y[:140], X[140:], y[140:],
-                          leak_X=X[140:], leak_y=1 - y[140:])
-        assert r["leak_score"] is not None and r["leak_score"] < 0.3, \
-            f"leak control did not register: {r['leak_score']}"
-        return f"leak control fires correctly (leak={r['leak_score']:.3f} on inverted labels)"
-
-    check("leak control is wired up", probe_detects_leak)
-
-    def underdetermined_warning():
-        rng = np.random.RandomState(2)
-        X, y = rng.randn(40, 512), rng.randint(0, 2, 40)
-        import warnings as W
-        with W.catch_warnings(record=True) as w:
-            W.simplefilter("always")
-            r = probing.probe(X[:28], y[:28], X[28:], y[28:])
-        assert any("n_features" in str(x.message) for x in w), "no warning raised"
-        assert r["underdetermined"]
-        return "n_features >= n_train is flagged"
-
-    check("underdetermined regime is flagged", underdetermined_warning)
-
-    print(f"\n=== pooling, directions, steering, rollouts ===")
-
-    def pooling():
-        from mechinterp import activations as _A
-        hs = _A.all_layers(model, tok, "The capital of France is")
-        shapes = {m: _A.pool_tokens(hs, m).shape for m in
-                  ("last", "mean", "suffix:3", "ema:0.5")}
-        assert len({s for s in shapes.values()}) == 1, shapes
-        # ema with decay 1.0 puts all weight on the final token.
-        assert torch.allclose(_A.pool_tokens(hs, "ema:1.0"), _A.pool_tokens(hs, "last"),
-                              atol=1e-2), "ema:1.0 should equal last-token pooling"
-        assert not torch.allclose(_A.pool_tokens(hs, "mean"), _A.pool_tokens(hs, "last"))
-        return f"4 modes -> {tuple(shapes['last'])}, ema:1.0 == last"
-
-    check("token pooling modes", pooling)
-
-    def calibration():
-        from mechinterp import steering
-        rng = np.random.RandomState(0)
-        acts = rng.randn(64, 128) * 3.0            # ||h|| ~ sqrt(128)*3 ~ 34
-        y = (rng.rand(64) > 0.5).astype(int)
-        d = steering.difference_of_means(acts, y)
-        cal = steering.calibrate(d, acts)
-        ratio = cal["direction_norm"] / cal["activation_norm_median"]
-        assert abs(cal["perturbation_at_coeff_1"] - ratio) < 1e-6
-        # coeff_for[f] must actually produce a perturbation of f.
-        for f, c in cal["coeff_for"].items():
-            assert abs(c * ratio - f) < 1e-6, f"coeff_for[{f}] wrong"
-        big = steering.calibrate(d * 50, acts)
-        assert big["warning"] is not None, "no warning on an oversized direction"
-        r = steering.random_control(d)
-        assert abs(np.linalg.norm(r) - np.linalg.norm(d)) < 1e-6, "control norm mismatch"
-        return (f"coeff=1 -> {cal['perturbation_at_coeff_1']:.1%} of ||h||; "
-                "warning fires; random control norm-matched")
-
-    check("steering calibration math", calibration)
-
-    def steerer():
-        from mechinterp import steering
-        ids = tok("The capital of France is", return_tensors="pt").to(model.device)
-        with torch.no_grad():
-            base = model(**ids).logits[0, -1].clone()
-        d = np.ones(base.shape[0] * 0 + model.config.hidden_size)
-        with steering.Steerer(model, 5, d, 0.0):          # coeff 0 == no-op
-            with torch.no_grad():
-                zero = model(**ids).logits[0, -1]
-        assert torch.allclose(base, zero), "coeff=0 changed the output"
-        with steering.Steerer(model, 5, d, 0.5, normalize=True, site_norm=50.0):
-            with torch.no_grad():
-                moved = model(**ids).logits[0, -1]
-        assert not torch.allclose(base, moved), "steering had no effect"
-        # hook must be removed on context exit
-        with torch.no_grad():
-            after = model(**ids).logits[0, -1]
-        assert torch.allclose(base, after), "hook leaked past the with-block"
-        return "coeff=0 no-op, coeff>0 moves logits, hook removed on exit"
-
-    check("steering hook lands and is removed", steerer)
-
-    def rollouts():
-        from mechinterp import rollout
-        rs = rollout.sample_rollouts(
-            model, tok, ["The capital of France is"], max_new_tokens=6,
-            n_samples=2, temperature=0.8, verifier=rollout.contains("Paris"))
-        assert len(rs) == 2
-        for r in rs:
-            assert r.acts.shape[0] == len(r.token_ids), \
-                f"acts {r.acts.shape} misaligned with {len(r.token_ids)} tokens"
-            assert r.acts.shape[1] == NL + 1, f"expected {NL+1} slots"
-            assert r.correct is not None
-        X, y, pos, grp = rollout.stack_steps(rs, layer=5, relative_to="end")
-        assert X.shape[0] == len(y) == len(pos) == len(grp)
-        assert pos.max() < 0, "relative_to='end' offsets should be negative"
-        return f"{len(rs)} rollouts, acts aligned to tokens, {X.shape[0]} probe rows"
-
-    check("sampled rollouts capture aligned activations", rollouts)
-
-    def transfer_control():
-        rng = np.random.RandomState(3)
-        X = rng.randn(200, 32); y = (X[:, 0] > 0).astype(int)
-        Xb = rng.randn(80, 32); yb = (Xb[:, 1] > 0).astype(int)   # different feature
-        r = probing.probe(X[:140], y[:140], X[140:], y[140:],
-                          transfer_X=Xb, transfer_y=yb)
-        assert r["transfer_score"] is not None
-        assert r["score"] > 0.8 and r["transfer_score"] < 0.7, \
-            f"transfer control did not separate: {r['score']:.3f}/{r['transfer_score']:.3f}"
-        return (f"in-domain {r['score']:.3f} vs out-of-domain "
-                f"{r['transfer_score']:.3f}")
-
-    check("cross-domain transfer control", transfer_control)
-
-    print(f"\n=== figures ===")
-
-    def figures_render():
-        import tempfile
-
-        from mechinterp import plotting
-        d = [100 * i / 12 for i in range(12)]
-        rng = np.random.RandomState(0)
-        per_layer = [list(rng.rand(8)) for _ in range(12)]
-        with tempfile.TemporaryDirectory() as td:
-            ax = plotting.layer_sweep({"a": per_layer, "b": per_layer}, d, "t", n=8)
-            plotting.save(ax.figure, f"{td}/sweep.png")
-            ax2 = plotting.probe_panel(d, per_layer, [0.1] * 12, 0.1, "t", n=8,
-                                       leak=[0.2] * 12)
-            plotting.save(ax2.figure, f"{td}/probe.png")
-            fig, _ = plotting.effect_grid(rng.rand(2, 12), ["x", "y"], d, "t", n=8)
-            plotting.save(fig, f"{td}/grid.png")
-            import os as _os
-            sizes = [_os.path.getsize(f"{td}/{f}") for f in
-                     ("sweep.png", "probe.png", "grid.png")]
-        assert all(s > 5000 for s in sizes), f"suspiciously small renders: {sizes}"
+    args = loading.cli()
+    ctx, failed, section = {}, [], None
+    for sec, fn in CHECKS:
+        if sec != section:
+            section = sec
+            print(f"\n=== {sec} ===")
+        if sec == "extraction" and "model" not in ctx:
+            ctx["model"], ctx["tok"] = loading.load_hf(args.model, args.quant)
+            ctx["NL"] = loading.n_layers(ctx["model"])
+            ctx.update(prompt="The capital of France is", corrupt="The capital of Germany is")
+            print(f"loaded {args.model} (quant={args.quant}), {ctx['NL']} layers")
+        if sec == "intervention" and "nn" not in ctx:
+            ctx["nn"] = loading.load_nnsight(args.model, args.quant)
         try:
-            plotting.layer_sweep({str(i): per_layer for i in range(4)}, d, "t")
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("4-series cap not enforced")
-        return f"3 forms render ({', '.join(f'{s//1024}kB' for s in sizes)}), series cap enforced"
-
-    check("figures render headless", figures_render)
-
+            print(f"[  ok  ] {fn.__name__} -- {fn(ctx)}")
+        except Exception as e:
+            print(f"[ FAIL ] {fn.__name__} -- {type(e).__name__}: {e}")
+            failed.append(fn.__name__)
+            if fn.__name__ == "gpu_kernels_run":
+                print("\nStop here: fix the torch/CUDA build before anything else.")
+                sys.exit(1)
     print()
-    if failures:
-        print(f"{len(failures)} check(s) FAILED: {', '.join(failures)}")
+    if failed:
+        print(f"{len(failed)} check(s) FAILED: {', '.join(failed)}")
         sys.exit(1)
-    print("All checks passed. The stack is good -- go write the experiment.")
+    print(f"All {len(CHECKS)} checks passed. The stack is good -- go write the experiment.")
 
 
 if __name__ == "__main__":

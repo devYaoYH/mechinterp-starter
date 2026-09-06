@@ -1,32 +1,25 @@
-"""Presentation-ready figures for layer sweeps and probe results.
+"""Presentation-ready figures.
 
-Three forms cover almost every mech-interp figure, and each encodes the metric
-reporting you should not have to remember:
+    layer_sweep()   several series over depth        -> multi-line + CI band
+    probe_panel()   one result against its controls  -> emphasis (accent + gray)
+    effect_grid()   position x layer                 -> sequential heatmap
 
-    layer_sweep()   several series over network depth      -> multi-line + CI band
-    probe_panel()   one probe score against its controls   -> emphasis (accent + gray)
-    effect_grid()   position x layer effects               -> sequential heatmap
+Each draws its reference line (chance, or zero effect), a bootstrap CI band, and
+a footer stating n and the interval method -- a sweep without a baseline is
+ambiguous to read, and one without a band invites reading noise as structure.
 
-Every one of them draws its reference line (chance, or zero effect), shows a
-confidence band, and prints `n` and the CI method in the footer -- because a
-mech-interp curve without a baseline is genuinely ambiguous to read, and one
-without a band invites reading noise as structure.
-
-Colors are the first three slots of a CVD-validated categorical palette
-(all-pairs deltaE 9.2 deutan / 24.0 normal, light surface). Do not add a fourth
-line: fold it into "other" or facet into small multiples. Aqua sits below 3:1
-contrast on the light surface, so series are direct-labeled as well as
-legended -- identity is never carried by color alone.
+Colors are the first three slots of a CVD-validated palette (all-pairs dE 9.2
+deutan / 24.0 normal, light surface), assigned in order, never cycled. Series
+are direct-labeled as well as legended because one slot is below 3:1 contrast.
+No fourth series: facet, or fold the tail into "other".
 """
 import os
 
 import numpy as np
 
-# Series slots 1-3 of the validated categorical palette. Order is the
-# CVD-safety mechanism, not cosmetic -- assign in order, never cycle.
 SERIES = ("#2a78d6", "#eb6834", "#1baf7a")
 INK, MUTED, CONTEXT, GRID = "#0b0b0b", "#52514e", "#8a8983", "#e2e1db"
-SEQ_HUE = "#2a78d6"
+DASH = (0, (4, 3))
 
 
 def _plt():
@@ -37,13 +30,23 @@ def _plt():
     return plt
 
 
+def bootstrap_ci(samples, n_boot=2000, alpha=0.05, seed=0):
+    """Percentile bootstrap CI of the mean -> (lo, mean, hi)."""
+    a = np.asarray(samples, float)
+    if not a.size:
+        return (np.nan,) * 3
+    m = a[np.random.RandomState(seed).randint(0, a.size, (n_boot, a.size))].mean(1)
+    return (float(np.percentile(m, 100 * alpha / 2)), float(a.mean()),
+            float(np.percentile(m, 100 * (1 - alpha / 2))))
+
+
 def style(ax, xlabel, ylabel, title=None):
-    """Recessive axes and grid; text in ink tokens, never in a series color."""
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color(GRID)
-    ax.grid(True, color=GRID, linewidth=0.8, alpha=0.9)
+    """Recessive axes and grid; text in ink tokens, never a series color."""
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    for s in ("left", "bottom"):
+        ax.spines[s].set_color(GRID)
+    ax.grid(True, color=GRID, linewidth=0.8)
     ax.set_axisbelow(True)
     ax.tick_params(colors=MUTED, labelsize=9, length=0)
     ax.set_xlabel(xlabel, color=MUTED, fontsize=10)
@@ -53,158 +56,114 @@ def style(ax, xlabel, ylabel, title=None):
     return ax
 
 
-def footer(fig, n, extra=None, ci="95% bootstrap CI, 2000 resamples", ci_prefix="band"):
-    """State n and the interval method on the figure. Not optional: a band with
-    an unstated method is not a reportable number."""
-    bits = [f"n = {n}", f"{ci_prefix} = {ci}"]
-    if extra:
-        bits.append(extra)
-    fig.text(0.01, 0.01, "  ·  ".join(bits), color=MUTED, fontsize=8, ha="left")
+def footer(fig, n, ci="95% bootstrap CI, 2000 resamples", prefix="band"):
+    """n and the interval method. A band with an unstated method is not a
+    reportable number."""
+    fig.text(0.01, 0.01, f"n = {n}  ·  {prefix} = {ci}", color=MUTED, fontsize=8)
 
 
-def bootstrap_ci(samples, n_boot=2000, alpha=0.05, seed=0):
-    """Percentile bootstrap CI of the mean. -> (lo, mean, hi)."""
-    a = np.asarray(samples, dtype=float)
-    if a.size == 0:
-        return (np.nan, np.nan, np.nan)
-    rng = np.random.RandomState(seed)
-    means = a[rng.randint(0, a.size, (n_boot, a.size))].mean(axis=1)
-    return (float(np.percentile(means, 100 * alpha / 2)), float(a.mean()),
-            float(np.percentile(means, 100 * (1 - alpha / 2))))
+def _series(ax, x, vals, color, label, ms=3.5):
+    """Draw one series. `vals` is per-x lists (band drawn) or per-x scalars."""
+    if np.ndim(vals[0]) > 0:
+        lo, mid, hi = (np.array(v) for v in zip(*[bootstrap_ci(v) for v in vals]))
+        ax.fill_between(x, lo, hi, color=color, alpha=0.18, linewidth=0, zorder=2)
+    else:
+        mid = np.asarray(vals, float)
+    ax.plot(x, mid, color=color, linewidth=2, marker="o", markersize=ms,
+            markeredgecolor="white", markeredgewidth=0.5, label=label, zorder=3)
+    return mid
+
+
+def _reference(ax, x0, value, label):
+    ax.axhline(value, color=CONTEXT, linewidth=1, linestyle=DASH, zorder=1)
+    ax.annotate(label, (x0, value), xytext=(0, 5), textcoords="offset points",
+                color=CONTEXT, fontsize=8, va="bottom")
+
+
+def _direct_label(ax, x, y, text, color, avoid=None, span=1.0):
+    """Label at the line end, nudged clear of the reference line."""
+    dy = 10 if (avoid is not None and abs(y - avoid) < 0.04 * span) else 0
+    ax.annotate(text, (x, y), xytext=(6, dy), textcoords="offset points",
+                color=color, fontsize=9, va="center", fontweight="bold")
+
+
+def _finish(fig, ax, depths, xpad, n, ci=None):
+    ax.legend(frameon=False, fontsize=9, labelcolor=MUTED, loc="best")
+    ax.set_xlim(min(depths) - 2, max(depths) + xpad)
+    if fig is not None:
+        fig.tight_layout(rect=(0, 0.04, 1, 1))
+        if n is not None:
+            footer(fig, n, **({"ci": ci} if ci else {}))
+    return ax
 
 
 def layer_sweep(series, depths, title, ylabel="Causal effect", reference=0.0,
                 reference_label="no effect", ax=None, n=None, ci_label=None):
-    """Several series over depth, with bootstrap CI bands and direct labels.
-
-    series: {label: [[v, ...] per layer]} -- per-layer lists of per-item values,
-            so the band is computed here; or {label: [scalar per layer]} for a
-            line with no band.
-    depths: x values (layer index or % depth), one per layer.
-    """
-    plt = _plt()
+    """series: {label: per-layer lists (banded) or per-layer scalars}."""
     if len(series) > 3:
-        raise ValueError(f"{len(series)} series: cap is 3. Facet into small "
-                         "multiples or fold the tail into 'other'.")
-    fig = None
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(7.5, 4.6))
-
+        raise ValueError(f"{len(series)} series: cap is 3. Facet, or fold into 'other'.")
+    fig, ax = (None, ax) if ax is not None else _plt().subplots(figsize=(7.5, 4.6))
     if reference is not None:
-        ax.axhline(reference, color=CONTEXT, linewidth=1, linestyle=(0, (4, 3)), zorder=1)
-        ax.annotate(reference_label, (depths[0], reference), xytext=(0, 5),
-                    textcoords="offset points", color=CONTEXT, fontsize=8, va="bottom")
-
+        _reference(ax, depths[0], reference, reference_label)
     for i, (label, vals) in enumerate(series.items()):
-        color = SERIES[i]
-        has_band = np.ndim(vals[0]) > 0
-        if has_band:
-            stats = [bootstrap_ci(v) for v in vals]
-            lo, mid, hi = (np.array([s[j] for s in stats]) for j in range(3))
-            ax.fill_between(depths, lo, hi, color=color, alpha=0.18, linewidth=0, zorder=2)
-        else:
-            mid = np.asarray(vals, dtype=float)
-        ax.plot(depths, mid, color=color, linewidth=2, marker="o", markersize=3.5,
-                markeredgecolor="white", markeredgewidth=0.5, label=label, zorder=3)
-        # Direct label: required here, since one slot is below 3:1 contrast.
-        # Nudge clear of the reference line rather than printing on top of it.
-        dy = 0
-        if reference is not None and abs(mid[-1] - reference) < 0.04 * (
-                np.nanmax(mid) - np.nanmin(mid) + 1e-9):
-            dy = 10
-        ax.annotate(label, (depths[-1], mid[-1]), xytext=(6, dy),
-                    textcoords="offset points", color=color, fontsize=9,
-                    va="center", fontweight="bold")
-
+        mid = _series(ax, depths, vals, SERIES[i], label)
+        _direct_label(ax, depths[-1], mid[-1], label, SERIES[i], reference,
+                      np.nanmax(mid) - np.nanmin(mid) + 1e-9)
     style(ax, "Layer depth (% of network)", ylabel, title)
-    ax.legend(frameon=False, fontsize=9, labelcolor=MUTED, loc="best")
-    ax.set_xlim(min(depths) - 2, max(depths) + 14)
-    if fig is not None:
-        fig.tight_layout(rect=(0, 0.04, 1, 1))
-        if n is not None:
-            footer(fig, n, ci=ci_label or "95% bootstrap CI, 2000 resamples")
-    return ax
+    return _finish(fig, ax, depths, 14, n, ci_label)
 
 
 def probe_panel(depths, scores, shuffled, chance, title, n=None,
-                ylabel="Held-out accuracy", leak=None, ax=None):
+                ylabel="Held-out accuracy", leak=None, transfer=None, ax=None):
     """Emphasis form: the probe is the point, its controls are context.
 
-    The controls are deliberately gray, not extra categorical colors -- they are
-    not peer series, and coloring them as such invites reading the null as a
-    finding. A probe curve shown without them is not interpretable.
+    Controls are gray, not categorical colors -- they are not peer series, and
+    coloring them as peers invites reading the null as a finding.
     """
-    plt = _plt()
-    fig = None
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(7.5, 4.6))
-
-    ax.axhline(chance, color=CONTEXT, linewidth=1, linestyle=(0, (4, 3)), zorder=1)
-    ax.annotate(f"chance ({chance:.2f})", (depths[0], chance), xytext=(0, 4),
-                textcoords="offset points", color=CONTEXT, fontsize=8, va="bottom")
-    ax.plot(depths, shuffled, color=CONTEXT, linewidth=1.5, linestyle=":",
-            label="shuffled-label null", zorder=2)
-    if leak is not None:
-        ax.plot(depths, leak, color=CONTEXT, linewidth=1.5, linestyle="-.",
-                alpha=0.75, label="shortcut-leak control", zorder=2)
-
-    has_band = np.ndim(scores[0]) > 0
-    if has_band:
-        stats = [bootstrap_ci(v) for v in scores]
-        lo, mid, hi = (np.array([s[j] for s in stats]) for j in range(3))
-        ax.fill_between(depths, lo, hi, color=SERIES[0], alpha=0.18, linewidth=0, zorder=3)
-    else:
-        mid = np.asarray(scores, dtype=float)
-    ax.plot(depths, mid, color=SERIES[0], linewidth=2, marker="o", markersize=4,
-            markeredgecolor="white", markeredgewidth=0.5, label="probe", zorder=4)
-    ax.annotate("probe", (depths[-1], mid[-1]), xytext=(6, 0), textcoords="offset points",
-                color=SERIES[0], fontsize=9, va="center", fontweight="bold")
-
+    fig, ax = (None, ax) if ax is not None else _plt().subplots(figsize=(7.5, 4.6))
+    _reference(ax, depths[0], chance, f"chance ({chance:.2f})")
+    for vals, ls, lab in ((shuffled, ":", "shuffled-label null"),
+                          (leak, "-.", "shortcut-leak control"),
+                          (transfer, (0, (1, 1)), "cross-domain transfer")):
+        if vals is not None:
+            ax.plot(depths, vals, color=CONTEXT, linewidth=1.5, linestyle=ls,
+                    label=lab, zorder=2)
+    mid = _series(ax, depths, scores, SERIES[0], "probe", ms=4)
+    _direct_label(ax, depths[-1], mid[-1], "probe", SERIES[0])
     style(ax, "Layer depth (% of network)", ylabel, title)
-    ax.legend(frameon=False, fontsize=9, labelcolor=MUTED, loc="best")
-    ax.set_xlim(min(depths) - 2, max(depths) + 12)
     ax.set_ylim(-0.03, 1.03)
-    if fig is not None:
-        fig.tight_layout(rect=(0, 0.04, 1, 1))
-        if n is not None:
-            footer(fig, n)
-    return ax
+    return _finish(fig, ax, depths, 12, n)
 
 
 def effect_grid(matrix, row_labels, depths, title, cbar_label="Causal effect",
                 diverging=False, n=None):
-    """position x layer heatmap. Sequential (one hue, light->dark) by default;
-    diverging (warm/cool poles, neutral gray midpoint) when the value is signed
-    and zero is meaningful. Never a rainbow."""
-    plt = _plt()
+    """Sequential (one hue, light->dark) by default; diverging (warm/cool poles,
+    neutral midpoint) when the value is signed and zero means something."""
     from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
-    M = np.asarray(matrix, dtype=float)
-
+    M, plt = np.asarray(matrix, float), _plt()
     if diverging:
-        cmap = LinearSegmentedColormap.from_list("div", ["#eb6834", "#eeeeea", SEQ_HUE])
-        norm = TwoSlopeNorm(vmin=min(M.min(), -1e-6), vcenter=0, vmax=max(M.max(), 1e-6))
+        cmap = LinearSegmentedColormap.from_list("d", [SERIES[1], "#eeeeea", SERIES[0]])
+        norm = TwoSlopeNorm(min(M.min(), -1e-6), 0, max(M.max(), 1e-6))
     else:
-        cmap = LinearSegmentedColormap.from_list("seq", ["#f4f7fc", SEQ_HUE, "#14335c"])
+        cmap = LinearSegmentedColormap.from_list("s", ["#f4f7fc", SERIES[0], "#14335c"])
         norm = None
-
     fig, ax = plt.subplots(figsize=(8.5, 1.1 + 0.55 * len(row_labels)))
     im = ax.imshow(M, aspect="auto", cmap=cmap, norm=norm, interpolation="nearest",
                    extent=(depths[0], depths[-1], len(row_labels) - 0.5, -0.5))
     ax.set_yticks(range(len(row_labels)))
     ax.set_yticklabels(row_labels, fontsize=9, color=INK)
     style(ax, "Layer depth (% of network)", "", title)
-    ax.grid(False)          # after style(), which turns it on
+    ax.grid(False)                      # after style(), which turns it on
     cb = fig.colorbar(im, ax=ax, pad=0.02)
     cb.set_label(cbar_label, color=MUTED, fontsize=9)
     cb.outline.set_visible(False)
     cb.ax.tick_params(colors=MUTED, labelsize=8, length=0)
     fig.tight_layout(rect=(0, 0.04, 1, 1))
     if n is not None:
-        footer(fig, n, ci="mean over items", ci_prefix="color")
+        footer(fig, n, ci="mean over items", prefix="color")
     return fig, ax
 
 
 def save(fig, path, dpi=200):
-    """Presentation default: 200 dpi on an off-white surface."""
     fig.savefig(path, dpi=dpi, facecolor="#fcfcfb", bbox_inches="tight")
     return path

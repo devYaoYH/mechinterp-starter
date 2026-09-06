@@ -16,7 +16,7 @@ git clone <this repo> && cd mechinterp-starter
 ./setup.sh
 source .venv/bin/activate
 python smoke_test.py          # ~1 min: verifies GPU, API shapes, and the harness
-python example_causal_trace.py --n-pairs 12
+python template_new_task.py --n-pairs 12   # probe -> intervene -> 3 figures
 ```
 
 If `smoke_test.py` is green, the stack works and any wrong number after that is
@@ -25,10 +25,9 @@ your experiment, not your environment. Run it again after any dependency bump.
 ## What's here
 
 ```
-smoke_test.py             16 checks over the whole stack -- run this first
-example_causal_trace.py   worked example: layer sweep, two positions, 30 pairs
-example_steering.py       worked example: direction -> calibrate -> steer + control
+smoke_test.py             14 checks over the whole stack -- run this first
 template_new_task.py      full arc for a fresh question: probe -> intervene -> plot
+example_steering.py       worked example: direction -> calibrate -> steer + control
 quantize_model.py         4-bit quantize + save + fidelity report
 mechinterp/loading.py     model loading; the bf16 / nf4 / prequantized branch
 mechinterp/activations.py extraction, token lookup, prompt-alignment assert
@@ -42,6 +41,27 @@ mechinterp/quantization.py  quantize, persist, and measure fidelity vs dense
 .claude/skills/           /fit-probe /run-intervention /report-figure /quantize-model
 setup.sh                  GPU-arch-aware bootstrap
 ```
+
+## Reading order
+
+1353 lines total, meant to be read end to end in an afternoon. Start here:
+
+| # | File | Lines | Why |
+|---|---|---|---|
+| 1 | `mechinterp/loading.py` | 55 | the three quant modes and the shared CLI |
+| 2 | `mechinterp/activations.py` | 80 | the `hs[L+1]` indexing convention everything else assumes |
+| 3 | `mechinterp/readout.py` | 37 | logit lens, and the already-normed trap |
+| 4 | `mechinterp/patching.py` | 67 | noising vs denoising, the normalized metric |
+| 5 | `mechinterp/probing.py` | 101 | the four controls |
+| 6 | `mechinterp/steering.py` | 138 | calibration — read `calibrate` closely |
+| 7 | `mechinterp/rollout.py` | 119 | sampled generation, if you need it |
+| 8 | `mechinterp/quantization.py` | 96 | two-phase fidelity, if you need it |
+| 9 | `mechinterp/plotting.py` | 169 | mostly matplotlib mechanics; skim |
+| 10 | `smoke_test.py` | 254 | each check names a real failure — read as a trap list |
+| 11 | `template_new_task.py` | 117 | how the pieces compose |
+
+Every module is plain functions over numpy/torch. There is no framework, no
+registry, no config system, and nothing is subclassed except `Steerer._should_fire`.
 
 ## Skills
 

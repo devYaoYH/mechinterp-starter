@@ -1,48 +1,55 @@
-"""Model loading. One place for the quantization branch, so experiment scripts
-don't each carry a copy of it."""
+"""Model loading. One place for the quantization branch.
+
+Assumes model.model.layers[i], model.model.norm, model.lm_head -- true of
+Llama/Qwen/Mistral-family causal LMs. Run smoke_test.py against a new
+architecture before trusting it.
+"""
+import argparse
+
 import torch
 
 QUANT_MODES = ("none", "nf4", "prequantized")
 
 
 def load_kwargs(quant="none"):
-    """kwargs for from_pretrained / nnsight.LanguageModel.
-
-    none          bf16 full precision.
-    nf4           quantize on load via bitsandbytes. Downloads the FULL-precision
-                  checkpoint first, then quantizes -- only use when no
-                  pre-quantized repo exists (~65GB vs ~19GB for a 32B model).
-    prequantized  checkpoint already stores NF4 weights + its own
-                  quantization_config (e.g. unsloth/*-bnb-4bit). Prefer this.
-    """
+    """none = bf16. nf4 = quantize on load (downloads the FULL-precision
+    checkpoint first). prequantized = weights already 4-bit on disk; prefer it."""
     if quant == "none":
         return dict(device_map="auto", dtype=torch.bfloat16)
+    if quant == "prequantized":
+        return dict(device_map="auto")
     if quant == "nf4":
         from transformers import BitsAndBytesConfig
         return dict(device_map="auto", quantization_config=BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16))
-    if quant == "prequantized":
-        return dict(device_map="auto")
     raise ValueError(f"quant must be one of {QUANT_MODES}, got {quant!r}")
 
 
 def load_hf(model_id, quant="none"):
-    """Plain transformers model + tokenizer. Use for extraction (fast path:
-    output_hidden_states) and for forward-hook interventions during generate()."""
+    """Plain transformers. Use for extraction and forward-hook interventions."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs(quant)).eval()
-    return model, tok
+    return (AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs(quant)).eval(),
+            AutoTokenizer.from_pretrained(model_id))
 
 
 def load_nnsight(model_id, quant="none"):
-    """nnsight LanguageModel. Use for cross-run activation patching, where the
-    donor/recipient trace pattern is much more ergonomic than raw hooks."""
+    """nnsight. Use for cross-run patching, where donor/recipient tracing is far
+    more ergonomic than raw hooks."""
     from nnsight import LanguageModel
     return LanguageModel(model_id, **load_kwargs(quant))
 
 
 def n_layers(model):
-    """Works for both wrappers, and for Llama/Qwen/Mistral-family causal LMs."""
     return len(model.model.layers)
+
+
+def cli(**extra):
+    """Shared argparse for the scripts: --model and --quant, plus `extra` as
+    {flag: dict(argparse kwargs)}."""
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="Qwen/Qwen2.5-1.5B-Instruct")
+    ap.add_argument("--quant", default="none", choices=QUANT_MODES)
+    for flag, kw in extra.items():
+        ap.add_argument(f"--{flag.replace('_', '-')}", **kw)
+    return ap.parse_args()
