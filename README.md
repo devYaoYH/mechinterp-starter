@@ -25,15 +25,57 @@ your experiment, not your environment. Run it again after any dependency bump.
 ## What's here
 
 ```
-smoke_test.py             10 checks over the whole stack -- run this first
+smoke_test.py             11 checks over the whole stack -- run this first
 example_causal_trace.py   worked example: layer sweep, two positions, 30 pairs
+template_new_task.py      full arc for a fresh question: probe -> intervene -> plot
+quantize_model.py         4-bit quantize + save + fidelity report
 mechinterp/loading.py     model loading; the bf16 / nf4 / prequantized branch
 mechinterp/activations.py extraction, token lookup, prompt-alignment assert
 mechinterp/patching.py    cross-run patching + the normalized effect metric
 mechinterp/readout.py     logit lens
 mechinterp/probing.py     linear probe with shuffled null, leak test, split
+mechinterp/plotting.py    three figure forms with CI bands and reference lines
+mechinterp/quantization.py  quantize, persist, and measure fidelity vs dense
+.claude/skills/           /fit-probe /run-intervention /report-figure /quantize-model
 setup.sh                  GPU-arch-aware bootstrap
 ```
+
+## Skills
+
+Cloning this repo brings four Claude Code skills with it. Each asks what it
+needs before it builds anything:
+
+| Skill | Asks about | Then |
+|---|---|---|
+| `/fit-probe` | label, contrast set, **leak set**, site | captures activations, sweeps layers, reports with controls |
+| `/run-intervention` | the causal claim, noising vs denoising, pairs, positions | runs the sweep, reports normalized effect with CI |
+| `/report-figure` | the one-sentence takeaway, the data's job, medium | picks the form, plots, re-reads the render, captions it |
+| `/quantize-model` | model, VRAM budget, quant type, fidelity | quantizes, saves, reports drift vs dense |
+
+`/fit-probe` will not skip the leak-set question, and `/report-figure` will not
+plot before you say what the figure should conclude — those are the two steps
+whose omission causes the most rework.
+
+## Quantization
+
+If a pre-quantized repo exists (`unsloth/*-bnb-4bit`), use it — quantize-on-load
+downloads the full dense checkpoint first (~65GB for a 32B model vs ~19GB).
+Otherwise:
+
+```bash
+python quantize_model.py --model Qwen/Qwen2.5-1.5B-Instruct --out ./q/qwen15b-nf4
+python smoke_test.py --model ./q/qwen15b-nf4 --quant prequantized
+```
+
+This captures a dense reference, **frees it**, quantizes, reloads from disk, and
+writes a fidelity report — two-phase because at 32B you cannot hold both models
+at once. Verified on Qwen2.5-1.5B: 3.09 GB → 1.12 GB, top-1 agreement 1.000,
+mean KL 0.119 nats, final-layer residual cosine 0.9885.
+
+**Read the fidelity report before trusting a result.** Even a clean nf4
+quantization moves the residual stream by 1-2%, and drift compounds with depth —
+enough to shift a marginal probe score, not enough to move a sharp causal
+crossover. Below 0.95 top-1 agreement, treat it as a different model.
 
 ## The four traps this encodes
 
@@ -110,8 +152,7 @@ reading token surprisal.
   against a full-precision repo downloads the bf16 weights first (~65GB for a 32B
   model) and then quantizes. An `unsloth/*-bnb-4bit` repo is ~19GB and runs the
   same. Use `--quant prequantized` for those, `nf4` only when no such repo exists.
-  *(The `nf4` and `prequantized` paths are not covered by the verified run above —
-  smoke-test them on your box before relying on them.)*
+  Both the `nf4` and `prequantized` paths are covered by the verified run above.
 - **Extraction uses plain transformers, intervention uses nnsight.**
   `output_hidden_states=True` returns every layer in one pass, which is simpler
   and much faster than looping a tracer; nnsight earns its place only for the
