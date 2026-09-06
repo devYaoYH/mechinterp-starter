@@ -58,6 +58,23 @@ def pooling_modes(c):
 
 
 @check("extraction")
+def hooked_capture_matches(c):
+    """Lower-memory path must agree with the simple one -- except at the last
+    layer, where hidden_states has had the final norm applied but a raw hook has
+    not. The slice must also be CLONED: a view keeps the whole [seq, hidden]
+    base alive and saves nothing."""
+    NL = c["NL"]
+    layers = [0, NL // 2, NL - 1]
+    hooked = A.capture_hooked(c["model"], c["tok"], [c["prompt"]], layers=layers)
+    full = A.at_position(c["model"], c["tok"], [c["prompt"]])
+    for j, L in enumerate(layers[:-1]):
+        assert np.allclose(hooked[0, j], full[0, L + 1], atol=1e-3), f"layer {L} mismatch"
+    assert not np.allclose(hooked[0, -1], full[0, NL], atol=1e-3), \
+        "last layer matched hidden_states -- the final norm should make them differ"
+    return f"layers {layers[:-1]} match slot L+1; last layer differs (final norm)"
+
+
+@check("extraction")
 def alignment_and_lookup(c):
     n = A.assert_aligned(c["tok"], c["prompt"], c["corrupt"])
     return f"{n} tokens, subject at index {A.token_index(c['tok'], c['prompt'], 'France')}"

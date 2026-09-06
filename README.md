@@ -28,6 +28,8 @@ your experiment, not your environment. Run it again after any dependency bump.
 smoke_test.py             14 checks over the whole stack -- run this first
 template_new_task.py      full arc for a fresh question: probe -> intervene -> plot
 example_steering.py       worked example: direction -> calibrate -> steer + control
+dump_capture.py           gate a capture (static or rollout) before training on it
+viewer.html               drop a capture.json in to inspect it; no server needed
 quantize_model.py         4-bit quantize + save + fidelity report
 mechinterp/loading.py     model loading; the bf16 / nf4 / prequantized branch
 mechinterp/activations.py extraction, token lookup, prompt-alignment assert
@@ -41,6 +43,30 @@ mechinterp/quantization.py  quantize, persist, and measure fidelity vs dense
 .claude/skills/           /fit-probe /run-intervention /report-figure /quantize-model
 setup.sh                  GPU-arch-aware bootstrap
 ```
+
+## Gate the capture before you spend anything on it
+
+Probe training, patching sweeps and steering runs are expensive, and they return
+plausible numbers on a broken dataset. `dump_capture.py` writes a self-contained
+JSON and runs the checks that catch the silent failures — misaligned tokens, a
+mark on the wrong token, rows byte-identical across labels, one class nearly
+absent, too few groups to split by, more dimensions than rows:
+
+```bash
+python dump_capture.py --out capture.json             # static prompts
+python dump_capture.py --out roll.json --rollouts     # sampled generations
+```
+
+Both capture kinds share one row model — an item has one row (static) or one per
+generated token (rollout) — so every check applies to both. It prints a verdict
+(`READY` / `WARN` / `BLOCKED`) headless; open `viewer.html` and drop the JSON in
+for the interactive version, which also shows you *which* rows clash.
+
+The degenerate-row check is the one that earns its keep. Sampled rollouts of the
+same prompt share prefix tokens, so their early-position activations are
+identical while carrying different correctness labels — a task that is
+unlearnable by construction at those positions. That is invisible in an array
+and obvious in the gate.
 
 ## Reading order
 

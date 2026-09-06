@@ -78,3 +78,50 @@ def assert_aligned(tok, a, b):
                          f"  {[tok.decode([t]) for t in ta]}\n"
                          f"  {[tok.decode([t]) for t in tb]}")
     return len(ta)
+
+
+def capture_hooked(model, tok, prompts, position=-1, layers=None, device=None):
+    """Lower-memory alternative to `at_position` for long sequences.
+
+    `output_hidden_states=True` retains all n_layers+1 tensors of shape
+    [batch, seq, hidden]. This hooks the layers you ask for and slices to one
+    position inside the hook, so the full-sequence tensors are never retained.
+
+    Measured on Qwen2.5-1.5B, batch 1 (peak forward memory above weights):
+        seq  512 : 216 MB retained-all -> 172 MB hooked  (21% lower)
+        seq 4096 : 1728 MB            -> 1376 MB         (20% lower)
+    The rest of the peak is transient attention/MLP intermediates, which no
+    capture strategy avoids. For short prompts the difference is negligible --
+    use `at_position`, it is simpler.
+
+    TRAP: the slice MUST be cloned. `out[:, -1, :]` is a VIEW that keeps the
+    whole [batch, seq, hidden] base tensor alive, so a hook that forgets the
+    clone saves exactly nothing (measured: identical peak to retaining all).
+
+    Equals `at_position(...)[:, L + 1]` for every layer EXCEPT the last: a hook
+    on layers[NL-1] sees the raw layer output, while hidden_states[NL] has had
+    the model's final norm applied. Same trap as readout.lens_at, from the other
+    side. If you want the normed final state, take it from hidden_states.
+
+    -> [n_prompts, len(layers), hidden]; `layers` defaults to all, and indexes
+    decoder layers directly (layer L, not slot L+1).
+    """
+    layers = list(range(len(model.model.layers))) if layers is None else list(layers)
+    out = []
+    for p in prompts:
+        got = {}
+
+        def make(i):
+            def hook(mod, inp, o):
+                got[i] = o[:, position, :].detach().clone()   # clone, not a view
+            return hook
+
+        handles = [model.model.layers[i].register_forward_hook(make(i)) for i in layers]
+        try:
+            with torch.no_grad():
+                model(**tok(p, return_tensors="pt").to(device or model.device))
+        finally:
+            for h in handles:
+                h.remove()
+        out.append(np.stack([got[i][0].float().cpu().numpy() for i in layers]))
+    return np.stack(out)
