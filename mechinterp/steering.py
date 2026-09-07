@@ -7,6 +7,14 @@ token, so the sweep measures "how broken is the model", not the concept.
 
 Always sweep `random_control()` alongside. If a matched-norm random direction
 degrades output the same way, the effect is magnitude, not meaning.
+
+To CHECK either one landed, read the site with `activations.capture_hooked`,
+not `all_layers`/`pooled` -- `output_hidden_states` does not see forward-hook
+substitutions, so an intervention that worked reads as one that did nothing.
+
+`Steerer` adds a direction; `Ablator` projects one out. Adding tests whether the
+direction can drive behaviour, ablating tests whether the model needs it -- the
+second is what a probe result actually asks.
 """
 import numpy as np
 import torch
@@ -136,3 +144,56 @@ class Steerer:
     @property
     def fire_rate(self):
         return self.n_fired / max(1, self.n_calls)
+
+
+def mean_component(direction, site_activations):
+    """Mean projection of the site's activations onto the direction.
+
+    Pass to `Ablator(mean_component=...)` to mean-ablate rather than zero-ablate.
+    Zeroing a component the model never sets to zero moves the stream off
+    distribution, so a behaviour change can mean "I broke it" rather than "it
+    needed that direction". The mean removes the variation, not the stream.
+    """
+    d = np.asarray(direction, float)
+    A = np.asarray(site_activations, float)
+    return float((A @ (d / (np.linalg.norm(d) + 1e-9))).mean())
+
+
+class Ablator(Steerer):
+    """Project a direction OUT of the residual stream at one layer:
+
+        h <- h - coeff * ((h.d_hat) - mean_component) * d_hat
+
+    The causal test that pairs with a PROBE. `Steerer` asks "does ADDING this
+    direction change behaviour", which a direction the model ignores can still
+    answer yes to if you push hard enough. This asks "does the model still work
+    WITHOUT it" -- the question a probe result actually raises.
+
+    coeff is a FRACTION of the component: 1.0 removes it, 0.5 halves it. So
+    there is no destructive regime to calibrate away from, unlike steering.
+
+    Still sweep `random_control(direction)` alongside: ablating ANY direction
+    costs the model something, and the claim needs this one to cost more.
+
+    The KV-cache caveat on `Steerer` applies unchanged.
+    """
+
+    def __init__(self, model, layer, direction, coeff=1.0, positions="last",
+                 mean_component=0.0):
+        super().__init__(model, layer, direction, coeff, normalize=True,
+                         positions=positions)
+        self.mean_component = mean_component
+
+    def _hook(self, module, inputs, h):
+        if self.coeff == 0:
+            return h
+        self.n_calls += 1
+        if not self._should_fire(h):
+            return h
+        self.n_fired += 1
+        d = self.direction.to(dtype=h.dtype, device=h.device)
+        sl = slice(None) if self.positions == "all" else slice(-1, None)
+        h = h.clone()
+        comp = (h[:, sl, :] * d).sum(-1, keepdim=True)          # [b, k, 1]
+        h[:, sl, :] -= self.coeff * (comp - self.mean_component) * d
+        return h

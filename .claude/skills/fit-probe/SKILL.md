@@ -24,6 +24,9 @@ Do NOT generate a dataset before asking. Use `AskUserQuestion` to settle:
    proposal so the user can accept or correct it rather than design from scratch.
 4. **The site.** Which token position (last token, subject token, a specific
    index) and which layers.
+5. **A neutral control set**, if the probe is meant to *detect* rather than
+   describe — inputs that should not trip it. It gives `recall_at_fpr`, the
+   operating point AUROC averages away.
 
 If the user cannot name a leak set, say so plainly and propose one; a probe
 without it is not interpretable. **The single most common failure is a label
@@ -37,8 +40,11 @@ retrieved nothing.
 ```python
 from mechinterp import activations as A, loading, probing
 model, tok = loading.load_hf(model_id, quant)
-X = A.at_position(model, tok, prompts, position=pos)   # [n, n_layers+1, hidden]
+X = A.at_position(model, tok, prompts, position=pos, cache="acts/")
 ```
+
+Pass `cache=` a directory: extraction is memoized per prompt, so re-running
+after changing the split, `C`, or the plot costs no forward passes.
 
 Use several phrasings per item so there is more than one example per class and
 the split can be **by template**, forcing generalization across surface form.
@@ -65,9 +71,17 @@ Give the user, for the best layer and the curve:
 - the `underdetermined` flag when `n_features >= n_train`; in that regime the
   training set is always separable and the held-out number is the only real one
 - `n`, and a bootstrap CI via `plotting.bootstrap_ci(r["per_item"])`
+- `recall_at_fpr` when a control set was given — a probe can sit at AUROC 0.92
+  and catch almost nothing at 1% FPR. Report its CI and heed its warning: the
+  threshold is a quantile of the controls, so fewer than `1/fpr` of them cannot
+  place it at all.
 
 Then say in one sentence what was and was not established. If asked for a
 figure, hand off to `/report-figure`.
+
+A probe result raises exactly one causal question: does the model *need* this
+direction? Offer `/run-intervention`, or ablate the probe direction directly
+with `steering.Ablator` against a `random_control` baseline.
 
 ## Two checks worth proposing
 

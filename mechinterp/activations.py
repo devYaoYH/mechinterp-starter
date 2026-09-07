@@ -13,9 +13,18 @@ TRAP: hidden_states[-1] has already had the final norm applied (see readout.py).
 import numpy as np
 import torch
 
+from . import cache as _cache
+
 
 def all_layers(model, tok, prompt, device=None):
-    """-> [n_layers + 1, seq, hidden] for one prompt."""
+    """-> [n_layers + 1, seq, hidden] for one prompt.
+
+    TRAP: this is BLIND to forward-hook interventions. A `Steerer` or `Ablator`
+    changes the logits, but the tensors here come back exactly as if it were not
+    there, so verifying an intervention this way reports a miss that did not
+    happen. Use `capture_hooked` to read an intervened run -- a forward hook
+    registered after the intervention's sees the substituted output.
+    """
     ids = tok(prompt, return_tensors="pt").to(device or model.device)
     with torch.no_grad():
         hs = model(**ids, output_hidden_states=True).hidden_states
@@ -47,16 +56,36 @@ def pool_tokens(hs, mode="last"):
     raise ValueError(f"unknown pooling mode {mode!r}")
 
 
-def pooled(model, tok, prompts, mode="last", device=None):
-    """-> [n_prompts, n_layers + 1, hidden] float32 on CPU."""
-    return np.stack([pool_tokens(all_layers(model, tok, p, device), mode)
-                     .float().cpu().numpy() for p in prompts])
+def _each(model, prompts, spec, cache_dir, compute):
+    """Per-prompt loop, with the optional disk cache in front of it. `spec`
+    names the extraction so two poolings of one prompt do not collide."""
+    if cache_dir is None:
+        return np.stack([compute(p) for p in prompts])
+    fp = _cache.model_fingerprint(model)
+    out = []
+    for p in prompts:
+        k = _cache.key(fp, spec, p)
+        got = _cache.load(cache_dir, k)
+        out.append(got if got is not None else _cache.store(cache_dir, k, compute(p)))
+    return np.stack(out)
 
 
-def at_position(model, tok, prompts, position=-1, device=None):
+def pooled(model, tok, prompts, mode="last", device=None, cache=None):
+    """-> [n_prompts, n_layers + 1, hidden] float32 on CPU.
+
+    cache: directory for the on-disk activation cache (see cache.py), or None.
+    Keyed on the weights as loaded, so a quantized run cannot read a dense one.
+    """
+    return _each(model, prompts, f"pool:{mode}", cache,
+                 lambda p: pool_tokens(all_layers(model, tok, p, device), mode)
+                 .float().cpu().numpy())
+
+
+def at_position(model, tok, prompts, position=-1, device=None, cache=None):
     """-> [n_prompts, n_layers + 1, hidden] at one token position."""
-    return np.stack([all_layers(model, tok, p, device)[:, position, :]
-                     .float().cpu().numpy() for p in prompts])
+    return _each(model, prompts, f"pos:{position}", cache,
+                 lambda p: all_layers(model, tok, p, device)[:, position, :]
+                 .float().cpu().numpy())
 
 
 def token_index(tok, prompt, word):
@@ -97,6 +126,10 @@ def capture_hooked(model, tok, prompts, position=-1, layers=None, device=None):
     TRAP: the slice MUST be cloned. `out[:, -1, :]` is a VIEW that keeps the
     whole [batch, seq, hidden] base tensor alive, so a hook that forgets the
     clone saves exactly nothing (measured: identical peak to retaining all).
+
+    It is also the ONLY way to read an intervened run: `all_layers` does not see
+    forward-hook substitutions, this does (hooks run in registration order, so
+    enter the Steerer/Ablator first).
 
     Equals `at_position(...)[:, L + 1]` for every layer EXCEPT the last: a hook
     on layers[NL-1] sees the raw layer output, while hidden_states[NL] has had

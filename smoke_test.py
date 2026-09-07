@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from mechinterp import activations as A
-from mechinterp import loading, patching, plotting, probing, readout, rollout, steering
+from mechinterp import cache, loading, patching, plotting, probing, readout, rollout, steering
 
 CHECKS = []
 
@@ -75,6 +75,25 @@ def hooked_capture_matches(c):
 
 
 @check("extraction")
+def cache_round_trips_and_keys_on_weights(c):
+    """A cache keyed on the model NAME alone serves dense activations into a
+    quantized run and never raises. The key must cover the weights as loaded."""
+    import os
+    import tempfile
+    model, tok, prompts = c["model"], c["tok"], [c["prompt"], c["corrupt"]]
+    with tempfile.TemporaryDirectory() as td:
+        cold = A.pooled(model, tok, prompts, cache=td)
+        assert np.array_equal(cold, A.pooled(model, tok, prompts, cache=td))
+        A.pooled(model, tok, prompts, mode="mean", cache=td)
+        assert len(os.listdir(td)) == 4, "pooling mode is not part of the key"
+
+    fp = cache.model_fingerprint(model)
+    assert cache.key(fp, "pool:last", c["prompt"]) != \
+        cache.key(fp.replace("dense", "bitsandbytes:nf4"), "pool:last", c["prompt"])
+    return f"round-trip ok, key = {fp}"
+
+
+@check("extraction")
 def alignment_and_lookup(c):
     n = A.assert_aligned(c["tok"], c["prompt"], c["corrupt"])
     return f"{n} tokens, subject at index {A.token_index(c['tok'], c['prompt'], 'France')}"
@@ -127,6 +146,31 @@ def patch_lands_and_is_localized(c):
     return f"subject L0={e0:.3f}, subject L{NL-1}={eL:.3f}, final L{NL-1}={eN:.3f}"
 
 
+@check("intervention")
+def hoisted_sweep_matches_per_layer(c):
+    """sweep_pair reads the donor once for every (layer, position) instead of
+    re-tracing per layer. Only a speedup if it is also identical -- a state
+    saved for the wrong layer still produces a smooth, plausible curve."""
+    nn, tok, NL = c["nn"], c["tok"], c["NL"]
+    ida = tok(" Paris", add_special_tokens=False)["input_ids"][0]
+    idb = tok(" Berlin", add_special_tokens=False)["input_ids"][0]
+    idx = A.token_index(tok, c["prompt"], "France")
+    layers = [0, NL // 2, NL - 1]
+    base = (patching.baseline_logits(nn, c["prompt"]),
+            patching.baseline_logits(nn, c["corrupt"]))
+
+    got, _, _ = patching.sweep_pair(nn, c["prompt"], c["corrupt"],
+                                    {"subj": idx, "final": -1}, ida, idb,
+                                    layers=layers, baselines=base)
+    for name, pos in (("subj", idx), ("final", -1)):
+        for L in layers:
+            want = patching.normalized_effect(
+                *base, patching.patch_at(nn, c["corrupt"], c["prompt"], L, pos), ida, idb)
+            assert abs(got[name][L] - want) < 1e-4, \
+                f"{name} L{L}: hoisted {got[name][L]:.5f} vs per-layer {want:.5f}"
+    return f"identical to patch_at over {len(layers)} layers x 2 positions"
+
+
 # ------------------------------------------------------------------ steering
 @check("steering")
 def calibration_math(c):
@@ -159,6 +203,40 @@ def hook_lands_and_is_removed(c):
     with torch.no_grad():
         assert torch.allclose(base, model(**ids).logits[0, -1]), "hook leaked past with-block"
     return "coeff=0 no-op, coeff>0 moves logits, hook removed on exit"
+
+
+@check("steering")
+def ablation_removes_the_component(c):
+    """Two failures at once. An ablation hook that misses looks exactly like
+    "the model did not need that direction" -- the null it exists to rule out.
+    And `output_hidden_states` is BLIND to forward-hook substitution, so the
+    obvious way to check the first one reports a miss that did not happen."""
+    model, tok, L = c["model"], c["tok"], c["NL"] // 2
+    X = A.pooled(model, tok, [c["prompt"], c["corrupt"]])[:, L + 1, :]
+    d = steering.difference_of_means(X, np.array([1, 0]))
+    dh = d / np.linalg.norm(d)
+
+    def component(**kw):
+        with steering.Ablator(model, L, d, **kw):
+            got = A.capture_hooked(model, tok, [c["prompt"]], position=-1, layers=[L])
+        return float(got[0, 0] @ dh)
+
+    base, mc = float(X[0] @ dh), steering.mean_component(d, X)
+    full, half, kept = (component(coeff=1.0), component(coeff=0.5),
+                        component(coeff=1.0, mean_component=mc))
+    assert abs(full) < 0.05 * abs(base), f"component {full:.4f} survived from {base:.4f}"
+    assert abs(half - 0.5 * base) < 0.1 * abs(base), f"coeff=0.5 gave {half:.4f}"
+    assert abs(kept - mc) < 0.05 * abs(mc), f"mean-ablated to {kept:.4f}, wanted {mc:.4f}"
+
+    with steering.Ablator(model, L, d, coeff=1.0) as ab:
+        blind = A.all_layers(model, tok, c["prompt"])[L + 1][-1].float().cpu().numpy() @ dh
+        assert ab.n_fired > 0, "hook never fired"
+    assert abs(float(blind) - base) < 1e-3, (
+        "output_hidden_states now REFLECTS forward hooks -- transformers changed; "
+        "drop the warning in activations.all_layers and steering.Steerer")
+    after = float(A.capture_hooked(model, tok, [c["prompt"]], position=-1, layers=[L])[0, 0] @ dh)
+    assert abs(after - base) < 1e-3, f"hook leaked past the with-block ({after:.4f})"
+    return f"{base:.3f} -> zero {full:.3f}, half {half:.3f}, mean {kept:.3f}"
 
 
 @check("steering")
@@ -199,6 +277,43 @@ def leak_and_transfer_controls(c):
     assert r["leak_score"] < 0.3, f"leak control did not register: {r['leak_score']}"
     assert r["score"] > 0.8 > r["transfer_score"], "transfer control did not separate"
     return f"leak={r['leak_score']:.3f}, in-domain {r['score']:.3f} vs transfer {r['transfer_score']:.3f}"
+
+
+@check("probing")
+def recall_at_fpr_math(c):
+    """A too-small control set does not raise -- it returns an unstable number
+    read off the largest two or three control scores."""
+    rng = np.random.RandomState(3)
+    ctl = rng.randn(2000)
+    sep = probing.recall_at_fpr(ctl + 10, ctl)
+    null = probing.recall_at_fpr(rng.randn(500), ctl)
+    assert sep["recall"] > 0.99 and sep["warning"] is None, sep
+    assert null["recall"] < 0.05, f"separated the unseparable: {null['recall']:.3f}"
+    assert null["ci"][0] <= null["recall"] <= null["ci"][1], null["ci"]
+    assert probing.recall_at_fpr(ctl + 10, ctl[:30])["warning"], "small control not flagged"
+
+    X = rng.randn(300, 16)
+    y = (X[:, 0] > 0).astype(int)
+    r = probing.probe(X[:200], y[:200], X[200:], y[200:],
+                      control_X=X[200:][y[200:] == 0], fpr=0.1)
+    assert r["recall_at_fpr"]["recall"] > 0.5, r["recall_at_fpr"]
+    return f"separated={sep['recall']:.2f}, null={null['recall']:.2f}, wired into probe()"
+
+
+@check("probing")
+def leak_metric_matches_headline(c):
+    """An AUROC score printed next to an accuracy leak_score reads as
+    comparable. It is not, and nothing raises."""
+    rng = np.random.RandomState(4)
+    X = rng.randn(200, 16)
+    y = (X[:, 0] > 0).astype(int)
+    r = probing.probe(X[:140], y[:140], X[140:], y[140:],
+                      leak_X=X[140:], leak_y=y[140:], metric="auroc")
+    one = probing.probe(X[:140], y[:140], X[140:], y[140:],
+                        leak_X=X[140:], leak_y=np.ones(60, int), metric="auroc")
+    assert 0.9 < r["leak_score"] <= 1.0, r["leak_score"]
+    assert one["leak_score"] is None, "single-class AUROC should be None, not a number"
+    return f"auroc leak={r['leak_score']:.3f}, single-class -> None"
 
 
 @check("probing")
